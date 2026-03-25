@@ -1,0 +1,13 @@
+# OpenClaw SSH Skill - 主机配置
+# 此文件不含敏感信息，可提交到 git
+# 密码等敏感字段存于 .secrets/<host>.env
+
+hosts:
+  jp-vps:
+    host: 140.238.33.64
+    port: 22
+    user: opc
+    auth: key
+    key_path: /tmp/ssh-key-2026-03-25.key
+    default_workdir: ~
+    tags: [production, japan, oci]

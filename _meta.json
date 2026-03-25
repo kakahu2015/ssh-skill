@@ -1,0 +1,13 @@
+{
+  "name": "ssh",
+  "version": "1.0.0",
+  "description": "SSH 远程登录与交互式会话技能，ControlMaster 复用连接，纯 bash 无外部依赖。",
+  "author": "kakahu2015",
+  "license": "MIT",
+  "keywords": ["ssh", "remote", "server", "scp", "vps", "devops"],
+  "categories": ["devops", "server"],
+  "requires": {
+    "bins": ["ssh"]
+  },
+  "minClawVersion": "0.1.0"
+}
