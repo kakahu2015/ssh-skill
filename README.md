@@ -1,65 +1,158 @@
-# SSH Skill (Agent-native 增强版)
+# SSH/Linux Ops Skill (Agent-native)
 
-OpenClaw 的 SSH 运维技能包，基于系统 `ssh` + ControlMaster，专为 AI Agent 远程操作和小规模/中规模 VPS 运维设计。
+OpenClaw 的通用 Linux 运维 skill，基于系统 `ssh` + ControlMaster，为 AI Agent 提供一组 **可组合、可审计、可批量执行的 Linux 操作 primitives**。
 
-> 这个项目不是传统 Ansible 克隆，而是 **Agent-native SSH 运维执行层**：让 Agent 通过稳定脚本 API 做连接、执行、批量调度、服务管理、文件传输、策略拦截和审计记录。
+> 目标不是把 Ansible playbook 换成 bash playbook，而是给 Agent 一套安全的 Linux 操作积木：Agent 自己观察、推理、选择下一步；skill 负责连接、执行、批量、脱敏、策略拦截、审计和结果落盘。
+
+## 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| Agent 自主组合 | 不内置僵硬流程，不强行规定“部署步骤” |
+| Primitive-first | 提供观察、文件、进程、网络、包管理、服务、锁等通用操作 |
+| SSH as syscall | `exec.sh` 是底层 syscall，其他脚本是更安全的 Linux primitives |
+| 结构化结果 | 返回 JSON，方便 Agent 继续判断 |
+| 批量安全 | `runner.sh` 提供并发、超时、失败率控制、结果落盘 |
+| 最小护栏 | 高风险动作需确认；其余让 Agent 自主推理 |
+| 不依赖远端 Agent | 远端只需要常见 Linux 命令，不要求 Python/Ansible |
 
 ## 核心能力
 
-| 能力 | 说明 |
+| 能力 | 脚本 |
 |------|------|
-| ControlMaster 复用 | `connect.sh` 建立持久连接，后续命令免重复认证 |
-| 安全分层配置 | `hosts.yaml` 放占位符，真实 IP/密钥路径放 `.secrets/<host>.env` |
-| 结构化输出 | 主要脚本返回 JSON，方便 Agent 继续决策 |
-| 批量并发 | `runner.sh` 支持 `--parallel`、`--timeout`、`--fail-fast` |
-| 目标选择 | `select_hosts.sh` 支持按 `tag/env/region/role/provider` 筛选 |
-| 策略拦截 | 高风险命令默认阻断，需要 `--confirm` 或 `SSH_SKILL_CONFIRMED=yes` |
-| 审计记录 | 执行事件写入 `.audit/YYYY-MM-DD/<run_id>.jsonl` |
-| 结果落盘 | 批量执行详情写入 `.runs/<run_id>/results/` |
-| 文件传输保护 | 被占用文件不再默认 kill，需要显式 `--force-release` |
+| SSH 连接复用 | `connect.sh`, `disconnect.sh` |
+| 自由命令执行 | `exec.sh` |
+| 批量并发执行 | `runner.sh` |
+| 主机选择 | `select_hosts.sh` |
+| 系统观察 | `sys.sh`, `facts.sh`, `patrol.sh` |
+| 文件操作 | `file.sh` |
+| 进程操作 | `proc.sh` |
+| 网络观察 | `net.sh` |
+| 包管理 | `pkg.sh` |
+| 服务管理 | `service.sh` |
+| 文件传输 | `scp_transfer.sh` |
+| 主机锁 | `lock.sh` |
+| 公共能力 | `common.sh`：JSON、脱敏、策略、审计、配置读取 |
 
 ## 快速开始
 
 ```bash
-# 1. 列出可用主机
+# 列主机
 bash scripts/list_hosts.sh
 
-# 2. 验证 ControlMaster socket 是否真实可用
-bash scripts/list_hosts.sh --check
-
-# 3. 建立连接
+# 建立连接
 bash scripts/connect.sh hk
 
-# 4. 单主机执行命令
+# 自由命令，适合 Agent 临时探索
 bash scripts/exec.sh hk "uptime"
 
-# 5. 多主机兼容执行
-bash scripts/exec.sh "hk,us-west,google" "uptime"
-
-# 6. 按标签/字段选择主机
-bash scripts/select_hosts.sh --target "tag=production" --csv
-
-# 7. 并发批量执行，适合几十到上百台 VPS
+# 批量命令，适合几十到上百台 VPS
 bash scripts/runner.sh --target "tag=production" --cmd "uptime" --parallel 20 --timeout 30
 
-# 8. 管理服务
-bash scripts/service.sh hk status caddy
-bash scripts/service.sh hk restart caddy
-
-# 9. 高风险动作需要确认
-bash scripts/service.sh hk stop caddy --confirm
-# 或者
-SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh hk "sudo systemctl stop caddy"
-
-# 10. 上传文件；如目标文件被占用，默认报错，不自动杀进程
-bash scripts/scp_transfer.sh hk upload ./caddy /usr/bin/caddy
-# 显式允许释放占用进程
-bash scripts/scp_transfer.sh hk upload ./caddy /usr/bin/caddy --force-release
+# 按标签/字段选择目标
+bash scripts/select_hosts.sh --target "tag=production,role=edge" --csv
 ```
 
-## Agent 批量运维入口
+## 通用 Linux primitives
 
-推荐让 Agent 优先使用 `runner.sh`，而不是手动循环调用 `exec.sh`。
+### 系统观察
+
+```bash
+bash scripts/sys.sh hk summary
+bash scripts/sys.sh hk disk
+bash scripts/sys.sh hk memory
+bash scripts/sys.sh hk load
+bash scripts/sys.sh hk journal caddy 100
+bash scripts/sys.sh hk dmesg 100
+```
+
+### 文件操作
+
+```bash
+bash scripts/file.sh hk exists /etc/caddy/Caddyfile
+bash scripts/file.sh hk stat /etc/caddy/Caddyfile
+bash scripts/file.sh hk tail /var/log/syslog 100
+bash scripts/file.sh hk grep "error" /var/log/syslog 50
+bash scripts/file.sh hk checksum /usr/bin/caddy
+bash scripts/file.sh hk backup /etc/caddy/Caddyfile
+bash scripts/file.sh hk mkdir /opt/app
+bash scripts/file.sh hk remove /tmp/old-file --confirm
+```
+
+### 进程操作
+
+```bash
+bash scripts/proc.sh hk top 30
+bash scripts/proc.sh hk mem 30
+bash scripts/proc.sh hk find caddy
+bash scripts/proc.sh hk tree 80
+bash scripts/proc.sh hk kill 1234 --confirm
+```
+
+### 网络操作
+
+```bash
+bash scripts/net.sh hk ports 100
+bash scripts/net.sh hk listen 443
+bash scripts/net.sh hk curl http://127.0.0.1:2019/config/ 40
+bash scripts/net.sh hk dns example.com
+bash scripts/net.sh hk route
+bash scripts/net.sh hk addr
+```
+
+### 包管理
+
+```bash
+bash scripts/pkg.sh hk detect
+bash scripts/pkg.sh hk search nginx 30
+bash scripts/pkg.sh hk installed curl
+bash scripts/pkg.sh hk update-cache --confirm
+bash scripts/pkg.sh hk install htop --confirm
+```
+
+### 服务管理
+
+```bash
+bash scripts/service.sh hk status caddy
+bash scripts/service.sh hk logs caddy
+bash scripts/service.sh hk restart caddy
+bash scripts/service.sh hk stop caddy --confirm
+```
+
+### 主机锁
+
+锁不是 workflow，只是给 Agent 协调并发写操作用：
+
+```bash
+bash scripts/lock.sh hk acquire --timeout 60 --run-id run_xxx
+bash scripts/lock.sh hk status
+bash scripts/lock.sh hk release --run-id run_xxx
+```
+
+## Agent 推荐工作方式
+
+Agent 不需要死板执行 playbook。推荐循环是：
+
+```text
+observe -> reason -> choose primitive -> execute -> inspect result -> continue/stop
+```
+
+例子：排查某台机器 Caddy 异常：
+
+```bash
+bash scripts/sys.sh hk summary
+bash scripts/service.sh hk status caddy
+bash scripts/sys.sh hk journal caddy 100
+bash scripts/net.sh hk listen 80
+bash scripts/net.sh hk listen 443
+bash scripts/file.sh hk stat /etc/caddy/Caddyfile
+```
+
+Agent 根据每一步 JSON 输出决定下一步，而不是照固定剧本执行。
+
+## 批量入口
+
+上百台 VPS 时，Agent 应优先用 `runner.sh`：
 
 ```bash
 bash scripts/runner.sh \
@@ -70,56 +163,23 @@ bash scripts/runner.sh \
   --fail-fast 20%
 ```
 
-返回摘要 JSON：
-
-```json
-{
-  "success": true,
-  "run_id": "run_20260424T120000Z_12345",
-  "target": "tag=production,role=edge",
-  "risk": "low",
-  "total": 120,
-  "ok": 118,
-  "failed": 2,
-  "skipped": 0,
-  "parallel": 20,
-  "timeout_sec": 30,
-  "results_dir": ".runs/run_xxx/results",
-  "audit_dir": ".audit/2026-04-24"
-}
-```
-
-每台机器的完整 stdout/stderr 会落盘到：
+摘要会打印到 stdout，详情落盘：
 
 ```text
 .runs/<run_id>/results/<host>.json
-```
-
-审计记录会落盘到：
-
-```text
 .audit/<date>/<run_id>.jsonl
 ```
 
 ## 目标选择
 
-`select_hosts.sh` 支持两类筛选：
-
 ```bash
-# 按 tag
 bash scripts/select_hosts.sh --tag production --csv
-
-# 按字段
 bash scripts/select_hosts.sh --field region=hk --field role=edge
-
-# 简写
 bash scripts/select_hosts.sh --env prod --role caddy --csv
-
-# 组合表达式
 bash scripts/select_hosts.sh --target "tag=production,region=hk,role=edge" --csv
 ```
 
-建议把 `hosts.yaml` 扩展为更适合批量运维的结构：
+建议 `hosts.yaml` 增加可筛选元数据：
 
 ```yaml
 hosts:
@@ -139,7 +199,9 @@ hosts:
 
 ## 策略拦截
 
-默认会拦截高风险命令，例如：
+保留最小护栏，不替 Agent 思考。
+
+默认拦截高风险动作，例如：
 
 - `rm -rf /`
 - `mkfs`
@@ -152,15 +214,10 @@ hosts:
 - `systemctl stop`
 - `systemctl disable`
 
-高风险命令必须显式确认：
+确认方式：
 
 ```bash
 bash scripts/exec.sh hk "sudo systemctl stop caddy" --confirm
-```
-
-或：
-
-```bash
 SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh hk "sudo systemctl stop caddy"
 ```
 
@@ -168,18 +225,20 @@ SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh hk "sudo systemctl stop caddy"
 
 ## 与 Ansible 的区别
 
-Ansible 适合人类编写 playbook、role、inventory，并进行声明式配置管理。
+Ansible 是人类声明式配置管理：playbook、role、inventory、变量、模板。
 
-ssh-skill 面向 AI Agent：
+这个 skill 是 Agent-native Linux 操作层：
 
-- 不要求提前编写 playbook
-- 不要求远端 Python/Ansible 环境
-- 每个操作都是可组合脚本 API
-- 输出结构化 JSON，方便 Agent 继续决策
-- 通过 ControlMaster 复用 SSH 连接
-- 支持并发、超时、失败率、审计和结果落盘
+- 不要求提前写 playbook
+- 不把业务流程写死在工具里
+- 给 Agent 通用 Linux primitives
+- Agent 根据观测结果自主组合步骤
+- 批量、审计、策略、脱敏由 skill 承担
+- 远端不需要 Python/Ansible 环境
 
-因此，ssh-skill 不是传统意义上的 Ansible 克隆，而是 **Agent-native 的远程运维执行层**。
+一句话：
+
+> Ansible 管“期望状态”；这个 skill 给 Agent 提供“可安全调用的 Linux 操作系统接口”。
 
 ## 目录结构
 
@@ -193,12 +252,20 @@ ssh-skill/
 │   ├── common.sh        # 公共函数：配置、JSON、脱敏、策略、审计
 │   ├── yaml.sh          # 轻量 YAML 解析
 │   ├── connect.sh       # 建立 ControlMaster 连接
-│   ├── exec.sh          # 执行远程命令
+│   ├── disconnect.sh    # 断开连接
+│   ├── exec.sh          # 自由命令执行
 │   ├── runner.sh        # 并发批量执行入口
 │   ├── select_hosts.sh  # 按 tag/字段选择主机
+│   ├── sys.sh           # 系统观察 primitive
+│   ├── file.sh          # 文件 primitive
+│   ├── proc.sh          # 进程 primitive
+│   ├── net.sh           # 网络 primitive
+│   ├── pkg.sh           # 包管理 primitive
+│   ├── service.sh       # 服务 primitive
 │   ├── scp_transfer.sh  # 文件传输
-│   ├── service.sh       # 服务管理
-│   ├── disconnect.sh    # 断开连接
+│   ├── facts.sh         # 主机事实采集
+│   ├── patrol.sh        # 轻量巡检
+│   ├── lock.sh          # 主机锁
 │   └── list_hosts.sh    # 列出主机
 ├── references/
 ├── .secrets/            # 真实凭据，本地存在，不提交
@@ -218,17 +285,17 @@ ssh-skill/
 
 ## 适用场景
 
-- AI Agent 远程执行命令
+- AI Agent 远程 Linux 操作
 - 5-100+ 台 VPS 的轻量批量运维
-- 文件分发、服务重启、状态检查
+- Agent 自动巡检、排障、修复建议、按需变更
+- 文件、进程、网络、服务、包管理等通用操作
 - 没有 Ansible 环境的快速运维
-- Agent 自动巡检/排障/部署的底层 SSH 执行层
 
 ## 不适合场景
 
-- 大规模声明式配置管理
+- 强声明式配置治理
 - 复杂 role/playbook 模板体系
-- 强幂等配置治理
-- 需要企业级 CMDB/权限审批/变更窗口的场景
+- 企业级 CMDB/审批/变更窗口
+- 强合规生产环境的无人值守自动变更
 
-这些场景可以继续用 Ansible、Terraform、SaltStack 或专门的运维平台。ssh-skill 更适合做 Agent 的安全执行层。
+这个 skill 适合作为 Agent 的 Linux 运维底座，而不是把 Agent 变成 Ansible 执行器。
