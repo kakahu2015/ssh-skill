@@ -2,136 +2,229 @@
 name: ssh
 version: 1.1.0
 description: >
-  SSH remote login and interactive session skill. Use when connecting to remote servers,
-  executing multiple remote commands, maintaining session state (working directory, environment),
-  uploading/downloading files (SCP), or managing remote processes/services.
-  Host config managed via hosts.yaml, sensitive credentials isolated in .secrets/<host>.env.
-  Uses system ssh with ControlMaster for persistent connection reuse across tool calls.
+  Agent-native SSH remote operations skill. Use when connecting to remote servers,
+  executing remote commands, running batch operations across VPS fleets, collecting host facts,
+  checking service health, uploading/downloading files, or managing remote processes/services.
+  Host config is managed via hosts.yaml, while real IPs, key paths, and credentials are isolated in
+  .secrets/<host>.env. Uses system ssh with ControlMaster for persistent connection reuse.
 compatibility:
   tools:
     - exec
   system_deps:
     - ssh
     - scp
+    - bash
+    - awk
+    - sed
     - sshpass       # optional, only for password auth
+    - timeout       # optional, used by runner.sh per-host timeout when available
 ---
 
 # SSH Skill
 
+This is an **Agent-native SSH operations layer**, not a human-first Ansible clone.
+It exposes safe, composable shell APIs that an AI Agent can call to operate VPS fleets.
+
 Uses system `ssh` + ControlMaster for persistent connection reuse across multiple tool calls.
-Host config in `hosts.yaml`, sensitive fields in `.secrets/<host>.env` (not in git).
+Host config lives in `hosts.yaml`; real IPs, key paths, and secrets live in `.secrets/<host>.env` and must not be committed.
 
 ---
 
-## Directory Structure
+## Preferred Agent Workflow
 
-```
-openclaw/skills/ssh/
-├── SKILL.md
-├── hosts.yaml                ← Host config (placeholders only, safe for git)
-├── hosts.yaml.bak            ← Original config backup
-├── scripts/
-│   ├── connect.sh            ← Establish ControlMaster background connection
-│   ├── exec.sh               ← Execute commands via ControlMaster
-│   ├── disconnect.sh         ← Close ControlMaster socket
-│   ├── scp_transfer.sh       ← File upload/download
-│   └── list_hosts.sh         ← List available hosts
-├── references/
-│   └── hosts_yaml_format.md  ← hosts.yaml format reference
-└── .secrets/                 ← Sensitive credentials (add to .gitignore)
-    ├── .gitignore
-    ├── <host>.env            ← Real IP + key path per host
-    └── <host>.env.example    ← Password/passphrase template
-```
-
-## Security Architecture
-
-**Dual-layer config**:
-- `hosts.yaml`: placeholders only (hostname, port, user) — safe to share/commit
-- `.secrets/<host>.env`: real IPs, key paths — **not in git**
-
-Scripts read hosts.yaml, then override with `HOST` and `KEY_PATH` from `.secrets/<host>.env`.
-If .secrets file is missing, scripts fall back to raw hosts.yaml values.
-
-**Output redaction**:
-- `exec.sh` has a built-in `redact()` function that automatically filters:
-  - `password=`, `passwd=`, `secret=`, `token=`, `api_key=` → `[REDACTED]`
-  - IPv4 addresses → `[REDACTED_IP]`
-- `list_hosts.sh` outputs only host aliases / metadata and does not print host or user fields
-
----
-
-## Workflow
-
-### Step 1: List and confirm hosts
+### 1. List available hosts
 
 ```bash
 bash skills/ssh/scripts/list_hosts.sh
 ```
 
-If user hasn't specified a host, show the list for selection.
+For real ControlMaster validation:
 
-### Step 2: Connect (ControlMaster)
+```bash
+bash skills/ssh/scripts/list_hosts.sh --check
+```
+
+### 2. Select targets by tags or fields
+
+Prefer selectors over hard-coded long host lists.
+
+```bash
+bash skills/ssh/scripts/select_hosts.sh --target "tag=production,role=edge" --csv
+bash skills/ssh/scripts/select_hosts.sh --env prod --region hk --role caddy --csv
+```
+
+### 3. Use runner.sh for fleet operations
+
+For multiple hosts or any operation that may touch many VPS, use `runner.sh` instead of manually looping over `exec.sh`.
+
+```bash
+bash skills/ssh/scripts/runner.sh \
+  --target "tag=production,role=edge" \
+  --cmd "uptime" \
+  --parallel 20 \
+  --timeout 30 \
+  --fail-fast 20%
+```
+
+`runner.sh` prints a compact JSON summary and stores detailed per-host results under:
+
+```text
+.runs/<run_id>/results/<host>.json
+```
+
+Audit events are written to:
+
+```text
+.audit/<YYYY-MM-DD>/<run_id>.jsonl
+```
+
+### 4. Single-host commands
 
 ```bash
 bash skills/ssh/scripts/connect.sh <host>
-```
-
-- Reads host config from `hosts.yaml`
-- If `auth: password`, loads `SSH_PASSWORD` from `.secrets/<host>.env` via `sshpass`
-- Creates ControlMaster socket in `/tmp/ssh-ctl/`
-- Background persistent connection (`-N -f -o ControlMaster=yes`)
-- Outputs connection status JSON
-
-**After connection succeeds**, all subsequent commands reuse this socket without re-authentication.
-
-### Step 3: Execute commands (interactive session)
-
-```bash
 bash skills/ssh/scripts/exec.sh <host> "command here"
 ```
 
-**State persistence strategy**: Each ssh invocation is a separate process, working directory does not persist. Two approaches:
+For multi-step operations, combine commands into one call:
 
-- **Method A (recommended)**: Set `default_workdir` in `hosts.yaml`, exec.sh auto-cds before each command
-- **Method B**: Explicitly include path in command, e.g. `cd /app && git pull`
-
-For multi-step operations, combine into one call:
 ```bash
 bash skills/ssh/scripts/exec.sh prod "cd /app && git pull && npm install && pm2 restart app"
 ```
 
-### Step 4: File transfer
+### 5. Service management
 
 ```bash
-# Upload
-bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/path /remote/path
+bash skills/ssh/scripts/service.sh hk status caddy
+bash skills/ssh/scripts/service.sh hk logs caddy
+bash skills/ssh/scripts/service.sh hk restart caddy
+```
 
-# Download
+High-risk service operations such as stop/disable require explicit confirmation:
+
+```bash
+bash skills/ssh/scripts/service.sh hk stop caddy --confirm
+```
+
+### 6. File transfer
+
+```bash
+bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/path /remote/path
 bash skills/ssh/scripts/scp_transfer.sh <host> download /remote/path /local/path
 ```
 
-SCP reuses the same ControlMaster socket, no re-authentication needed.
-
-### Step 5: Disconnect
+If an upload target is busy, the script returns `target_busy` by default. Do not kill remote processes unless explicitly authorized:
 
 ```bash
-bash skills/ssh/scripts/disconnect.sh <host>
+bash skills/ssh/scripts/scp_transfer.sh hk upload ./caddy /usr/bin/caddy --force-release
 ```
 
-Execute when user says "exit", "disconnect", "close", "done".
+### 7. Facts and patrol checks
+
+Collect lightweight host facts:
+
+```bash
+bash skills/ssh/scripts/facts.sh --target "tag=production" --parallel 20 --timeout 30
+```
+
+Run a patrol health check for disk usage and service activity:
+
+```bash
+bash skills/ssh/scripts/patrol.sh --target "tag=production,role=edge" --service caddy --disk-threshold 85 --parallel 20
+```
+
+---
+
+## Directory Structure
+
+```text
+openclaw/skills/ssh/
+├── SKILL.md
+├── README.md
+├── _meta.json
+├── hosts.yaml                ← Host config, placeholders only, safe for git
+├── scripts/
+│   ├── common.sh             ← Shared config, JSON, redaction, policy, audit helpers
+│   ├── yaml.sh               ← Tiny hosts.yaml parser
+│   ├── connect.sh            ← Establish ControlMaster background connection
+│   ├── exec.sh               ← Execute commands via ControlMaster
+│   ├── runner.sh             ← Concurrent fleet runner for Agent operations
+│   ├── select_hosts.sh       ← Select hosts by tag/env/region/role/provider
+│   ├── facts.sh              ← Collect lightweight host facts
+│   ├── patrol.sh             ← Lightweight fleet health checks
+│   ├── service.sh            ← Service management wrapper
+│   ├── scp_transfer.sh       ← File upload/download
+│   ├── disconnect.sh         ← Close ControlMaster socket
+│   └── list_hosts.sh         ← List available hosts
+├── references/
+│   └── hosts_yaml_format.md
+├── .secrets/                 ← Sensitive credentials, not committed
+├── .runs/                    ← Runtime batch results, not committed
+├── .audit/                   ← Runtime audit logs, not committed
+└── .state/                   ← Future local state DB/cache, not committed
+```
+
+---
+
+## Security Architecture
+
+**Dual-layer config**:
+
+- `hosts.yaml`: placeholders and non-secret metadata only — safe to share/commit
+- `.secrets/<host>.env`: real IPs, key paths, credentials — must not be committed
+
+Scripts read `hosts.yaml`, then override host and key path from `.secrets/<host>.env` or `.secrets/<alias-target>.env` when available.
+
+**Output redaction**:
+
+- `password=`, `passwd=`, `secret=`, `token=`, `api_key=` → `[REDACTED]`
+- IPv4 addresses → `[REDACTED_IP]`
+- common private-key paths → `[REDACTED_KEY_PATH]`
 
 ---
 
 ## Security Rules (MUST follow)
 
-1. **Never output credentials**: IPs, usernames, passwords, key paths, key contents — must not appear in conversation
-2. **Never read private key contents**: Reference by path only (`ssh -i /path/to/key`), never `cat` or `read` key files
-3. **Never modify config files**: hosts.yaml and .secrets/ are read-only
-4. **Confirm destructive commands**: Before executing `rm -rf`, `dd`, `systemctl stop`, `DROP TABLE`, `> /dev/sda`, etc., explicitly confirm with user
-5. **Output redaction**: exec.sh has built-in redact() for password/token/IP; manually add `[REDACTED]` for anything missed
-6. **No sudo passwords**: Do not embed sudo passwords in commands; suggest `NOPASSWD` config or manual operation
-7. **Missing hosts.yaml**: Show format guide and prompt user to create
+1. **Never output credentials**: IPs, usernames, passwords, key paths, key contents must not appear in conversation.
+2. **Never read private key contents**: Reference keys by path only. Never `cat` or print private keys.
+3. **Never modify `.secrets/` from Agent commands** unless the user explicitly asks.
+4. **Prefer structured tools**: Use `service.sh`, `scp_transfer.sh`, `facts.sh`, `patrol.sh`, and `runner.sh` before free-form shell commands.
+5. **Use runner for fleets**: For more than a few hosts, use `runner.sh` with `--parallel`, `--timeout`, and preferably `--fail-fast`.
+6. **Confirm destructive commands**: High-risk commands require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
+7. **No sudo passwords**: Do not embed sudo passwords in commands. Suggest NOPASSWD sudoers or manual operation.
+8. **Truncate large outputs**: Add `head`, `tail`, or other limits to log/list commands.
+9. **Do not auto-kill busy processes**: File upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
+10. **Review summaries before follow-up actions**: After batch operations, inspect summary and failed hosts before remedial changes.
+
+---
+
+## Policy Guard
+
+High-risk commands are blocked unless explicitly confirmed. Examples:
+
+- `rm -rf /`
+- `mkfs`
+- `dd if=`
+- `shutdown` / `reboot`
+- `iptables -F`
+- `ufw disable`
+- `killall`
+- `fuser -k`
+- `systemctl stop`
+- `systemctl disable`
+
+Medium-risk commands, such as broad service restarts, require confirmation when they affect more than 20 hosts.
+
+Confirm explicitly:
+
+```bash
+bash skills/ssh/scripts/exec.sh hk "sudo systemctl stop caddy" --confirm
+```
+
+or:
+
+```bash
+SSH_SKILL_CONFIRMED=yes bash skills/ssh/scripts/exec.sh hk "sudo systemctl stop caddy"
+```
 
 ---
 
@@ -139,32 +232,38 @@ Execute when user says "exit", "disconnect", "close", "done".
 
 ```yaml
 hosts:
-  prod:
-    host: prod                          # Placeholder, real IP in .secrets/prod.env
+  prod-edge-01:
+    host: prod-edge-01                  # Placeholder, real IP/domain in .secrets/prod-edge-01.env
     port: 22
     user: ubuntu
     auth: key
-    key_path: /keys/prod                # Placeholder, real path in .secrets/prod.env
+    key_path: /keys/prod-edge-01        # Placeholder, real path in .secrets/prod-edge-01.env
     default_workdir: /opt/myapp
-    tags: [production]
+    provider: oci
+    region: us-west
+    env: prod
+    role: edge
+    tags: [production, us-west, caddy, edge]
 ```
 
-Corresponding `.secrets/prod.env`:
+Corresponding `.secrets/prod-edge-01.env`:
+
 ```bash
 HOST=1.2.3.4
 KEY_PATH=/root/.ssh/id_ed25519
 ```
 
-For password auth, `.secrets/<host>.env` also needs:
+For password auth:
+
 ```bash
 SSH_PASSWORD=your_password
 ```
 
 ---
 
-## 输出截断
+## Output Truncation
 
-执行可能输出大量内容的命令时，**必须自行加管道截断**，避免撑爆 agent context：
+Commands that may output a lot of text must be truncated by the caller:
 
 ```bash
 dmesg | tail -50
@@ -174,16 +273,20 @@ find / -name "*.log" | head -30
 ps aux | head -50
 ```
 
-通用原则：日志类用 `tail -N`，列表类用 `head -N`，N 控制在 50-200。
+Use `tail -N` for logs and `head -N` for long lists. Keep N around 50-200.
+
+---
 
 ## Error Handling
 
 | Error | Action |
 |-------|--------|
-| `hosts.yaml` not found | Show format guide, prompt user to create |
-| Host not in yaml | List existing hosts, ask to add new |
-| `sshpass` not installed | Suggest `apt install sshpass` or switch to key auth |
-| Connection timeout | Check host/port/firewall, ask to retry |
-| Auth failed | Check .secrets/ config, do not output credentials |
-| ControlMaster socket expired | Auto re-run connect.sh then retry |
-| Command exit_code != 0 | Return exit_code + stderr, ask if troubleshooting needed |
+| `hosts.yaml` not found | Show format guide and ask user to create it |
+| Host not in yaml | List existing hosts and ask user to add the host |
+| `sshpass` not installed | Suggest installing `sshpass` or switching to key auth |
+| Connection timeout | Check host/port/firewall and retry later |
+| Auth failed | Check `.secrets/` config; do not output credentials |
+| ControlMaster socket expired | Auto re-run `connect.sh`, then retry |
+| `policy_blocked` | Ask for explicit confirmation before continuing |
+| `target_busy` | Ask whether to retry with `--force-release` |
+| Command `exit_code != 0` | Return JSON result and summarize failed hosts |
