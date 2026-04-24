@@ -28,8 +28,25 @@ AUTH_TYPE=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "auth")
 KEY_PATH=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "key_path")
 JUMP_HOST=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "jump_host")
 
+# .secrets/<host>.env 覆盖（IP/密钥路径不走 YAML）
+# 解析 alias：如果 hosts.yaml 里 host 字段指向另一个主机名，用那个名字找 secrets
+REAL_HOST="$SSH_HOST"
+SECRETS_ENV="$SECRETS_DIR/${REAL_HOST}.env"
+if [[ ! -f "$SECRETS_ENV" ]]; then
+    SECRETS_ENV="$SECRETS_DIR/${HOST_NAME}.env"
+fi
+if [[ -f "$SECRETS_ENV" ]]; then
+    _H=$(grep -E '^HOST=' "$SECRETS_ENV" | cut -d= -f2-)
+    _K=$(grep -E '^KEY_PATH=' "$SECRETS_ENV" | cut -d= -f2-)
+    [[ -n "$_H" ]] && SSH_HOST="$_H"
+    [[ -n "$_K" ]] && KEY_PATH="$_K"
+fi
+
 [[ -z "$SSH_HOST" || -z "$SSH_USER" || -z "$AUTH_TYPE" ]] && \
     die "config_incomplete" "hosts.yaml 中 $HOST_NAME 缺少 host/user/auth 字段（或主机不存在）"
+
+# 不做 ping 预检查，直接依赖 ssh 的 ConnectTimeout。
+# 原因：部分环境没有 ping，之前会把“本地缺命令”误报成“远端超时”。
 
 # ── ControlMaster 检查：如果已有活跃连接则直接返回 ──
 mkdir -p "$CTL_DIR"
@@ -46,8 +63,8 @@ fi
 SSH_OPTS=(
     -o "ControlMaster=yes"
     -o "ControlPath=$CTL_SOCKET"
-    -o "ControlPersist=10m"
-    -o "StrictHostKeyChecking=no"
+    -o "ControlPersist=30m"
+    -o "StrictHostKeyChecking=accept-new"
     -o "BatchMode=no"
     -o "ConnectTimeout=15"
     -p "$SSH_PORT"
@@ -70,7 +87,14 @@ case "$AUTH_TYPE" in
     KEY_PATH_EXP="${KEY_PATH/#\~/$HOME}"
     [[ -f "$KEY_PATH_EXP" ]] || die "key_not_found" "私钥文件不存在: $KEY_PATH_EXP"
     SSH_OPTS+=(-i "$KEY_PATH_EXP" -o "IdentitiesOnly=yes")
-    ssh "${SSH_OPTS[@]}" -N -f "${SSH_USER}@${SSH_HOST}" 2>/tmp/ssh-connect-err && RC=0 || RC=$?
+    _ERR=$(mktemp)
+    MAX_RETRY=3
+    RC=1
+    for i in $(seq 1 $MAX_RETRY); do
+        echo "[ssh-skill] 连接尝试 $i/$MAX_RETRY..." >&2
+        ssh "${SSH_OPTS[@]}" -N -f "${SSH_USER}@${SSH_HOST}" 2>"$_ERR" && RC=0 && break
+        sleep 2
+    done
     ;;
   password)
     require_cmd sshpass
@@ -78,8 +102,10 @@ case "$AUTH_TYPE" in
     [[ -f "$SECRETS_FILE" ]] || die "secrets_not_found" "密码文件不存在: $SECRETS_FILE"
     SSH_PASSWORD=$(grep -E '^SSH_PASSWORD=' "$SECRETS_FILE" | cut -d= -f2- | tr -d "'\"\r")
     [[ -z "$SSH_PASSWORD" ]] && die "config_error" "SSH_PASSWORD 为空: $SECRETS_FILE"
-    sshpass -p "$SSH_PASSWORD" ssh "${SSH_OPTS[@]}" -N -f "${SSH_USER}@${SSH_HOST}" 2>/tmp/ssh-connect-err && RC=0 || RC=$?
-    unset SSH_PASSWORD
+    _ERR=$(mktemp)
+    export SSHPASS="$SSH_PASSWORD"
+    sshpass -e ssh "${SSH_OPTS[@]}" -N -f "${SSH_USER}@${SSH_HOST}" 2>"$_ERR" && RC=0 || RC=$?
+    unset SSHPASS SSH_PASSWORD
     ;;
   *)
     die "config_error" "不支持的 auth 类型: $AUTH_TYPE（有效值: key | password）"
@@ -88,9 +114,11 @@ esac
 
 # ── 结果输出 ──
 if [[ "${RC:-0}" -eq 0 ]] && [[ -S "$CTL_SOCKET" ]]; then
+    rm -f "$_ERR"
     echo "{\"success\":true,\"host\":\"$HOST_NAME\",\"status\":\"connected\",\"socket\":\"$CTL_SOCKET\"}"
 else
-    ERR=$(cat /tmp/ssh-connect-err 2>/dev/null | head -3 | tr '\n' ' ')
+    ERR=$(cat "$_ERR" 2>/dev/null | head -3 | tr '\n' ' ')
+    rm -f "$_ERR"
     echo "{\"success\":false,\"host\":\"$HOST_NAME\",\"error\":\"connect_failed\",\"detail\":\"$(echo "$ERR" | sed 's/"/\\"/g')\"}"
     exit 1
 fi

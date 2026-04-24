@@ -4,10 +4,92 @@
 
 hosts:
   jp-vps:
-    host: 140.238.33.64
+    host: jp-vps
     port: 22
     user: opc
     auth: key
-    key_path: /tmp/ssh-key-2026-03-25.key
-    default_workdir: ~
+    key_path: /keys/jp-vps
+    default_workdir: /home/opc
     tags: [production, japan, oci]
+
+  jp:
+    host: jp-vps
+    port: 22
+    user: opc
+    auth: key
+    key_path: /keys/jp-vps
+    default_workdir: /home/opc
+    tags: [production, japan, oci]
+
+  hk-vps:
+    host: hk-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/hk-vps
+    default_workdir: /root
+    tags: [production, hk, alibba]
+
+  hk:
+    host: hk-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/hk-vps
+    default_workdir: /root
+    tags: [production, hk, alibba]
+
+  us-west-vps:
+    host: us-west-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/us-west-vps
+    default_workdir: /root
+    tags: [production, us-west, oci]
+
+  us-west:
+    host: us-west-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/us-west-vps
+    default_workdir: /root
+    tags: [production, us-west, oci]
+
+  sjc-vps:
+    host: sjc-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/sjc-vps
+    default_workdir: /root
+    tags: [production, sjc, oci]
+
+  sjc:
+    host: sjc-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/sjc-vps
+    default_workdir: /root
+    tags: [production, sjc, oci]
+
+  google-vps:
+    host: google-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/google-vps
+    default_workdir: /root
+    tags: [production, google, google]
+
+  google:
+    host: google-vps
+    port: 22
+    user: root
+    auth: key
+    key_path: /keys/google-vps
+    default_workdir: /root
+    tags: [production, google, google]
+

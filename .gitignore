@@ -1,0 +1,11 @@
+# Sensitive credentials
+.secrets/
+
+# Ignore any local overrides
+*.local
+*.bak
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db

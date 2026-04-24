@@ -18,8 +18,6 @@ echo "{"
 echo "  \"hosts\": ["
 
 for HOST_NAME in $HOSTS; do
-    HOST=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "host")
-    USER=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "user")
     AUTH=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "auth")
     JUMP=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "jump_host")
     SOCKET="$CTL_DIR/${HOST_NAME}.sock"
@@ -28,11 +26,9 @@ for HOST_NAME in $HOSTS; do
     [ $COUNT -gt 0 ] && echo ","
 
     echo "    {"
-    echo "      \"name\": \"$HOST_NAME\","
-    echo "      \"host\": \"$HOST\","
-    echo "      \"user\": \"$USER\","
-    echo "      \"auth\": \"$AUTH\","
-    echo "      \"jump_host\": \"${JUMP:-}\","
+    echo "      \"name\": \"$HOST_NAME\"," 
+    echo "      \"auth\": \"$AUTH\"," 
+    echo "      \"jump_host\": \"${JUMP:-}\"," 
     echo "      \"connected\": $CONNECTED"
     printf "    }"
 

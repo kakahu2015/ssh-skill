@@ -1,173 +1,189 @@
 ---
 name: ssh
-version: 1.0.0
+version: 1.1.0
 description: >
-  SSH 远程登录与交互式会话技能。当用户需要连接到远程服务器、持续执行多条远程命令、
-  维持会话状态（工作目录、环境变量）、上传/下载文件（SCP）、管理远程进程或服务时使用。
-  主机配置从 hosts.yaml 集中管理，敏感凭据通过独立 .secrets/<host>.env 隔离存储。
-  调用系统 ssh 命令（ControlMaster 复用连接实现伪交互式会话）。
-  触发关键词：ssh、登录服务器、远程执行、连接到、部署到、在服务器上、scp、
-  "去 vps 看看"、"在 prod 上跑"、远程主机、跳板机。
+  SSH remote login and interactive session skill. Use when connecting to remote servers,
+  executing multiple remote commands, maintaining session state (working directory, environment),
+  uploading/downloading files (SCP), or managing remote processes/services.
+  Host config managed via hosts.yaml, sensitive credentials isolated in .secrets/<host>.env.
+  Uses system ssh with ControlMaster for persistent connection reuse across tool calls.
 compatibility:
   tools:
-    - bash_tool
+    - exec
   system_deps:
     - ssh
     - scp
-    - sshpass       # 仅密码登录时需要，可选
+    - sshpass       # optional, only for password auth
 ---
 
 # SSH Skill
 
-使用系统 `ssh` + ControlMaster 实现跨多次 bash_tool 调用的持久连接复用。
-主机配置集中在 `hosts.yaml`，密码等敏感字段存于 `.secrets/<host>.env`（不入 git）。
+Uses system `ssh` + ControlMaster for persistent connection reuse across multiple tool calls.
+Host config in `hosts.yaml`, sensitive fields in `.secrets/<host>.env` (not in git).
 
 ---
 
-## 目录结构
+## Directory Structure
 
 ```
 openclaw/skills/ssh/
 ├── SKILL.md
-├── hosts.yaml                ← 所有主机配置（无敏感信息，可入 git）
+├── hosts.yaml                ← Host config (placeholders only, safe for git)
+├── hosts.yaml.bak            ← Original config backup
 ├── scripts/
-│   ├── connect.sh            ← 建立 ControlMaster 后台连接
-│   ├── exec.sh               ← 复用连接执行命令
-│   ├── disconnect.sh         ← 关闭 ControlMaster socket
-│   ├── scp_transfer.sh       ← 文件上传/下载
-│   └── list_hosts.sh         ← 列出可用主机
+│   ├── connect.sh            ← Establish ControlMaster background connection
+│   ├── exec.sh               ← Execute commands via ControlMaster
+│   ├── disconnect.sh         ← Close ControlMaster socket
+│   ├── scp_transfer.sh       ← File upload/download
+│   └── list_hosts.sh         ← List available hosts
 ├── references/
-│   └── hosts_yaml_format.md  ← hosts.yaml 格式说明
-└── .secrets/                 ← 敏感凭据目录（整体加入 .gitignore）
+│   └── hosts_yaml_format.md  ← hosts.yaml format reference
+└── .secrets/                 ← Sensitive credentials (add to .gitignore)
     ├── .gitignore
-    └── <host>.env.example    ← 密码/passphrase 模板
+    ├── <host>.env            ← Real IP + key path per host
+    └── <host>.env.example    ← Password/passphrase template
 ```
+
+## Security Architecture
+
+**Dual-layer config**:
+- `hosts.yaml`: placeholders only (hostname, port, user) — safe to share/commit
+- `.secrets/<host>.env`: real IPs, key paths — **not in git**
+
+Scripts read hosts.yaml, then override with `HOST` and `KEY_PATH` from `.secrets/<host>.env`.
+If .secrets file is missing, scripts fall back to raw hosts.yaml values.
+
+**Output redaction**:
+- `exec.sh` has a built-in `redact()` function that automatically filters:
+  - `password=`, `passwd=`, `secret=`, `token=`, `api_key=` → `[REDACTED]`
+  - IPv4 addresses → `[REDACTED_IP]`
+- `list_hosts.sh` outputs only host aliases / metadata and does not print host or user fields
 
 ---
 
-## 工作流程
+## Workflow
 
-### Step 1：列出并确认主机
+### Step 1: List and confirm hosts
 
 ```bash
 bash skills/ssh/scripts/list_hosts.sh
 ```
 
-如果用户未明确指定主机名，展示列表让用户选择。
+If user hasn't specified a host, show the list for selection.
 
-### Step 2：建立连接（ControlMaster）
+### Step 2: Connect (ControlMaster)
 
 ```bash
 bash skills/ssh/scripts/connect.sh <host>
 ```
 
-- 读取 `hosts.yaml` 中该主机的配置
-- 若 `auth: password`，从 `.secrets/<host>.env` 加载 `SSH_PASSWORD`，通过 `sshpass` 传入
-- 在 `/tmp/ssh-ctl/` 下创建 ControlMaster socket
-- 后台保持连接（`-N -f -o ControlMaster=yes`）
-- 输出连接状态 JSON
+- Reads host config from `hosts.yaml`
+- If `auth: password`, loads `SSH_PASSWORD` from `.secrets/<host>.env` via `sshpass`
+- Creates ControlMaster socket in `/tmp/ssh-ctl/`
+- Background persistent connection (`-N -f -o ControlMaster=yes`)
+- Outputs connection status JSON
 
-**连接成功后**，后续所有命令复用此 socket，无需重复认证。
+**After connection succeeds**, all subsequent commands reuse this socket without re-authentication.
 
-### Step 3：执行命令（交互式会话）
+### Step 3: Execute commands (interactive session)
 
 ```bash
 bash skills/ssh/scripts/exec.sh <host> "command here"
 ```
 
-**状态保持策略**：ssh 每次是独立进程，工作目录不跨调用持久。有两种方式处理：
+**State persistence strategy**: Each ssh invocation is a separate process, working directory does not persist. Two approaches:
 
-- **方式 A（推荐）**：在 `hosts.yaml` 设置 `default_workdir`，exec.sh 自动 `cd` 到该目录再执行
-- **方式 B**：用户在命令中显式写路径，如 `cd /app && git pull`
+- **Method A (recommended)**: Set `default_workdir` in `hosts.yaml`, exec.sh auto-cds before each command
+- **Method B**: Explicitly include path in command, e.g. `cd /app && git pull`
 
-需要维持状态时（如多步部署），将多条命令合并为一次调用：
+For multi-step operations, combine into one call:
 ```bash
 bash skills/ssh/scripts/exec.sh prod "cd /app && git pull && npm install && pm2 restart app"
 ```
 
-### Step 4：文件传输
+### Step 4: File transfer
 
 ```bash
-# 上传
+# Upload
 bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/path /remote/path
 
-# 下载
+# Download
 bash skills/ssh/scripts/scp_transfer.sh <host> download /remote/path /local/path
 ```
 
-SCP 同样通过 ControlMaster socket 复用，无需重复认证。
+SCP reuses the same ControlMaster socket, no re-authentication needed.
 
-### Step 5：关闭连接
+### Step 5: Disconnect
 
 ```bash
 bash skills/ssh/scripts/disconnect.sh <host>
 ```
 
-用户说"退出"、"断开"、"关闭连接"、"不用了"时执行。
+Execute when user says "exit", "disconnect", "close", "done".
 
 ---
 
-## 安全规则（必须遵守）
+## Security Rules (MUST follow)
 
-1. **不输出凭据**：IP、用户名、密码、私钥路径、私钥内容，一律不在对话中显示
-2. **不修改配置文件**：hosts.yaml 和 .secrets/ 只读，不写入
-3. **破坏性命令需确认**：执行 `rm -rf`、`dd`、`systemctl stop`、`DROP TABLE`、`> /dev/sda` 等前，必须向用户明确确认
-4. **输出脱敏**：命令输出中出现 `password=`、`token=`、`secret=`、`key=` 等字样，替换为 `[REDACTED]` 后展示
-5. **sudo 密码**：不在命令中嵌入 sudo 密码；如需 sudo，提示用户配置 `NOPASSWD` 或手动操作
-6. **hosts.yaml 不存在时**：展示下方格式说明，引导用户创建
+1. **Never output credentials**: IPs, usernames, passwords, key paths, key contents — must not appear in conversation
+2. **Never read private key contents**: Reference by path only (`ssh -i /path/to/key`), never `cat` or `read` key files
+3. **Never modify config files**: hosts.yaml and .secrets/ are read-only
+4. **Confirm destructive commands**: Before executing `rm -rf`, `dd`, `systemctl stop`, `DROP TABLE`, `> /dev/sda`, etc., explicitly confirm with user
+5. **Output redaction**: exec.sh has built-in redact() for password/token/IP; manually add `[REDACTED]` for anything missed
+6. **No sudo passwords**: Do not embed sudo passwords in commands; suggest `NOPASSWD` config or manual operation
+7. **Missing hosts.yaml**: Show format guide and prompt user to create
 
 ---
 
-## hosts.yaml 格式
+## hosts.yaml Format
 
 ```yaml
 hosts:
   prod:
-    host: 1.2.3.4
+    host: prod                          # Placeholder, real IP in .secrets/prod.env
     port: 22
     user: ubuntu
-    auth: key                        # key | password
-    key_path: ~/.ssh/id_ed25519      # auth: key 时必填
-    default_workdir: /opt/myapp      # 可选，每次执行自动 cd
+    auth: key
+    key_path: /keys/prod                # Placeholder, real path in .secrets/prod.env
+    default_workdir: /opt/myapp
     tags: [production]
+```
 
-  dev-server:
-    host: 192.168.1.50
-    port: 2222
-    user: admin
-    auth: password                   # 密码从 .secrets/dev-server.env 读取
-    default_workdir: ~
-    tags: [dev, internal]
+Corresponding `.secrets/prod.env`:
+```bash
+HOST=1.2.3.4
+KEY_PATH=/root/.ssh/id_ed25519
+```
 
-  bastion-jump:
-    host: jump.example.com
-    port: 22
-    user: ec2-user
-    auth: key
-    key_path: ~/.ssh/jump.pem
-    tags: [jump]
-
-  prod-internal:
-    host: 10.0.0.5
-    port: 22
-    user: ubuntu
-    auth: key
-    key_path: ~/.ssh/id_ed25519
-    jump_host: bastion-jump          # ProxyJump，引用上面的主机名
-    default_workdir: /srv/app
-    tags: [production, internal]
+For password auth, `.secrets/<host>.env` also needs:
+```bash
+SSH_PASSWORD=your_password
 ```
 
 ---
 
-## 错误处理
+## 输出截断
 
-| 错误 | 处理 |
-|------|------|
-| `hosts.yaml` 不存在 | 展示格式说明，引导用户创建 |
-| 主机名不在 yaml 中 | 列出已有主机，询问是否新增 |
-| `sshpass` 未安装 | 提示 `apt install sshpass` 或改用私钥认证 |
-| 连接超时 | 提示检查 host/port/防火墙，询问是否重试 |
-| 认证失败 | 提示检查 .secrets/ 配置，不输出具体凭据 |
-| ControlMaster socket 已过期 | 自动重新执行 connect.sh 后重试 |
-| 命令 exit_code != 0 | 展示 stderr，询问是否需要排查 |
+执行可能输出大量内容的命令时，**必须自行加管道截断**，避免撑爆 agent context：
+
+```bash
+dmesg | tail -50
+journalctl --since today | head -100
+cat /var/log/syslog | tail -200
+find / -name "*.log" | head -30
+ps aux | head -50
+```
+
+通用原则：日志类用 `tail -N`，列表类用 `head -N`，N 控制在 50-200。
+
+## Error Handling
+
+| Error | Action |
+|-------|--------|
+| `hosts.yaml` not found | Show format guide, prompt user to create |
+| Host not in yaml | List existing hosts, ask to add new |
+| `sshpass` not installed | Suggest `apt install sshpass` or switch to key auth |
+| Connection timeout | Check host/port/firewall, ask to retry |
+| Auth failed | Check .secrets/ config, do not output credentials |
+| ControlMaster socket expired | Auto re-run connect.sh then retry |
+| Command exit_code != 0 | Return exit_code + stderr, ask if troubleshooting needed |
