@@ -1,53 +1,45 @@
 #!/usr/bin/env bash
 # OpenClaw SSH Skill - SCP 文件传输（复用 ControlMaster）
 # 用法:
-#   bash scp_transfer.sh <host> upload   /local/path /remote/path
+#   bash scp_transfer.sh <host> upload   /local/path /remote/path [--force-release]
 #   bash scp_transfer.sh <host> download /remote/path /local/path
 set -euo pipefail
 
-HOST_NAME="${1:?用法: scp_transfer.sh <host> <upload|download> <src> <dst>}"
+HOST_NAME="${1:?用法: scp_transfer.sh <host> <upload|download> <src> <dst> [--force-release]}"
 DIRECTION="${2:?缺少方向: upload 或 download}"
 SRC="${3:?缺少源路径}"
 DST="${4:?缺少目标路径}"
+FORCE_RELEASE="${5:-}"
 
-SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPTS_DIR/yaml.sh"
+# shellcheck source=/dev/null
+source "$SCRIPTS_DIR/common.sh"
 
-HOSTS_YAML="$SKILL_DIR/hosts.yaml"
-SECRETS_DIR="$SKILL_DIR/.secrets"
-CTL_SOCKET="/tmp/ssh-ctl/${HOST_NAME}.sock"
+load_host_config "$HOST_NAME"
+CTL_SOCKET="$(control_socket "$HOST_NAME")"
+RUN_ID="${SSH_SKILL_RUN_ID:-$(make_run_id)}"
+ensure_connected "$HOST_NAME" "$CTL_SOCKET"
 
-die() { echo "{\"success\":false,\"error\":\"$1\",\"message\":\"$2\"}"; exit 1; }
+remote_quote() {
+    printf '%q' "$1"
+}
 
-SSH_HOST=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "host")
-SSH_PORT=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "port"); SSH_PORT="${SSH_PORT:-22}"
-SSH_USER=$(read_yaml "$HOSTS_YAML" "$HOST_NAME" "user")
+run_remote_raw() {
+    local cmd="$1"
+    ssh -o "ControlMaster=no" -o "ControlPath=$CTL_SOCKET" -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "bash -lc $(printf '%q' "$cmd")"
+}
 
-# .secrets/<host>.env 覆盖（IP 不走 YAML）
-SECRETS_ENV="$SECRETS_DIR/${HOST_NAME}.env"
-if [[ -f "$SECRETS_ENV" ]]; then
-    _H=$(grep -E '^HOST=' "$SECRETS_ENV" | cut -d= -f2-)
-    [[ -n "$_H" ]] && SSH_HOST="$_H"
-fi
-
-[[ ! -S "$CTL_SOCKET" ]] && die "not_connected" "未建立连接，请先运行 connect.sh $HOST_NAME"
-
-# 上传前检查并释放被占用的目标文件
 check_and_release_file() {
-    local remote_file="$1"
-    # 检查文件是否存在且被占用
-    local check_cmd="if [ -f '$remote_file' ]; then if fuser '$remote_file' >/dev/null 2>&1; then echo 'BUSY'; else echo 'FREE'; fi; else echo 'NOT_EXIST'; fi"
-    local status
-    status=$(ssh -o "ControlPath=$CTL_SOCKET" -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "$check_cmd" 2>/dev/null || echo "ERROR")
+    local remote_file="$1" quoted status
+    quoted="$(remote_quote "$remote_file")"
+    status=$(run_remote_raw "if [ -f $quoted ]; then if command -v fuser >/dev/null 2>&1 && fuser $quoted >/dev/null 2>&1; then echo BUSY; else echo FREE; fi; else echo NOT_EXIST; fi" 2>/dev/null || echo "ERROR")
     if echo "$status" | grep -q "BUSY"; then
-        echo "[ssh-skill] 检测到目标文件被占用，尝试释放..." >&2
-        # 尝试停掉常见服务（按文件名判断）
-        if echo "$remote_file" | grep -q "caddy"; then
-            ssh -o "ControlPath=$CTL_SOCKET" -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "sudo systemctl stop caddy 2>/dev/null; sudo killall -9 caddy 2>/dev/null; sleep 1" || true
+        if [[ "$FORCE_RELEASE" != "--force-release" && "${SSH_SKILL_FORCE_RELEASE:-}" != "yes" ]]; then
+            die_json "target_busy" "目标文件被进程占用，未自动释放。需要显式追加 --force-release 或设置 SSH_SKILL_FORCE_RELEASE=yes: $remote_file" "$HOST_NAME"
         fi
-        # 通用：强制杀掉占用进程
-        ssh -o "ControlPath=$CTL_SOCKET" -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "sudo fuser -k '$remote_file' 2>/dev/null; sleep 1" || true
+        policy_check_command "sudo fuser -k $quoted" 1 "--confirm"
+        echo "[ssh-skill] 检测到目标文件被占用，按显式授权释放..." >&2
+        run_remote_raw "sudo fuser -k $quoted 2>/dev/null; sleep 1" >/dev/null 2>&1 || true
     fi
 }
 
@@ -57,19 +49,43 @@ SCP_OPTS=(
     -P "$SSH_PORT"
 )
 
+START_MS=$(date +%s%3N 2>/dev/null || date +%s000)
 case "$DIRECTION" in
   upload)
-    [[ -e "$SRC" ]] || die "not_found" "本地文件不存在: $SRC"
-    # 上传前检查并释放目标文件占用
+    [[ -e "$SRC" ]] || die_json "not_found" "本地文件不存在: $SRC" "$HOST_NAME"
     check_and_release_file "$DST"
-    scp "${SCP_OPTS[@]}" "$SRC" "${SSH_USER}@${SSH_HOST}:${DST}"
-    echo "{\"success\":true,\"host\":\"$HOST_NAME\",\"operation\":\"upload\",\"local\":\"$SRC\",\"remote\":\"$DST\"}"
+    set +e
+    SCP_OUT=$(scp "${SCP_OPTS[@]}" "$SRC" "${SSH_USER}@${SSH_HOST}:${DST}" 2>&1)
+    RC=$?
+    set -e
     ;;
   download)
-    scp "${SCP_OPTS[@]}" "${SSH_USER}@${SSH_HOST}:${SRC}" "$DST"
-    echo "{\"success\":true,\"host\":\"$HOST_NAME\",\"operation\":\"download\",\"remote\":\"$SRC\",\"local\":\"$DST\"}"
+    set +e
+    SCP_OUT=$(scp "${SCP_OPTS[@]}" "${SSH_USER}@${SSH_HOST}:${SRC}" "$DST" 2>&1)
+    RC=$?
+    set -e
     ;;
   *)
-    die "invalid_direction" "方向必须是 upload 或 download，收到: $DIRECTION"
+    die_json "invalid_direction" "方向必须是 upload 或 download，收到: $DIRECTION" "$HOST_NAME"
     ;;
 esac
+END_MS=$(date +%s%3N 2>/dev/null || date +%s000)
+DURATION_MS=$((END_MS - START_MS))
+SCP_OUT="$(redact_string "$SCP_OUT")"
+SUCCESS=$([ "$RC" -eq 0 ] && echo true || echo false)
+write_audit_event "$RUN_ID" "$HOST_NAME" "scp_$DIRECTION" "$SUCCESS" "$RC" "$DURATION_MS" "$DIRECTION $SRC $DST"
+
+cat <<JSON
+{
+  "success": $SUCCESS,
+  "run_id": "$(json_escape "$RUN_ID")",
+  "host": "$(json_escape "$HOST_NAME")",
+  "operation": "$(json_escape "$DIRECTION")",
+  "exit_code": $RC,
+  "duration_ms": $DURATION_MS,
+  "src": "$(json_escape "$SRC")",
+  "dst": "$(json_escape "$DST")",
+  "stderr": "$(json_escape "$SCP_OUT")"
+}
+JSON
+exit "$RC"
