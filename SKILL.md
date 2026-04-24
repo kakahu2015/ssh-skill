@@ -1,12 +1,12 @@
 ---
-name: ssh
-version: 1.1.0
+name: linux-ops
+version: 1.2.0
 description: >
-  Agent-native SSH remote operations skill. Use when connecting to remote servers,
-  executing remote commands, running batch operations across VPS fleets, collecting host facts,
-  checking service health, uploading/downloading files, or managing remote processes/services.
-  Host config is managed via hosts.yaml, while real IPs, key paths, and credentials are isolated in
-  .secrets/<host>.env. Uses system ssh with ControlMaster for persistent connection reuse.
+  Agent-native Linux operations skill over SSH. Use when an AI Agent needs to observe,
+  reason about, and operate remote Linux servers using composable primitives: system,
+  file, process, network, package, service, transfer, locks, and free-form commands.
+  Supports ControlMaster connection reuse, target selection, concurrent batch execution,
+  policy guardrails, output redaction, audit logs, and per-run result storage.
 compatibility:
   tools:
     - exec
@@ -16,190 +16,212 @@ compatibility:
     - bash
     - awk
     - sed
+    - grep
     - sshpass       # optional, only for password auth
     - timeout       # optional, used by runner.sh per-host timeout when available
 ---
 
-# SSH Skill
+# Linux Ops Skill
 
-This is an **Agent-native SSH operations layer**, not a human-first Ansible clone.
-It exposes safe, composable shell APIs that an AI Agent can call to operate VPS fleets.
+This is an **Agent-native Linux operations primitive layer over SSH**.
 
-Uses system `ssh` + ControlMaster for persistent connection reuse across multiple tool calls.
-Host config lives in `hosts.yaml`; real IPs, key paths, and secrets live in `.secrets/<host>.env` and must not be committed.
+It is not an Ansible clone and should not be used like a rigid playbook runner. The Agent should:
+
+```text
+observe -> reason -> choose primitive -> execute -> inspect result -> continue or stop
+```
+
+The skill provides safe, composable Linux operation primitives. The Agent remains responsible for diagnosis, sequencing, and deciding the next action.
+
+---
+
+## Core Model
+
+- `exec.sh` is the low-level SSH syscall.
+- `runner.sh` is the concurrent fleet executor.
+- `select_hosts.sh` is the targeting layer.
+- `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh` are Linux operation primitives.
+- `lock.sh` is a coordination primitive for write operations.
+- `common.sh` provides config loading, JSON output, redaction, policy checks, and audit logging.
+
+Prefer primitives over free-form shell when a primitive exists, but do not force a fixed workflow. Let the Agent combine primitives based on observations.
 
 ---
 
 ## Preferred Agent Workflow
 
-### 1. List available hosts
+### 1. List hosts
 
 ```bash
 bash skills/ssh/scripts/list_hosts.sh
-```
-
-For real ControlMaster validation:
-
-```bash
 bash skills/ssh/scripts/list_hosts.sh --check
 ```
 
-### 2. Select targets by tags or fields
-
-Prefer selectors over hard-coded long host lists.
+### 2. Select target hosts
 
 ```bash
 bash skills/ssh/scripts/select_hosts.sh --target "tag=production,role=edge" --csv
 bash skills/ssh/scripts/select_hosts.sh --env prod --region hk --role caddy --csv
 ```
 
-### 3. Use runner.sh for fleet operations
+### 3. Observe first
 
-For multiple hosts or any operation that may touch many VPS, use `runner.sh` instead of manually looping over `exec.sh`.
+Single host:
+
+```bash
+bash skills/ssh/scripts/sys.sh hk summary
+bash skills/ssh/scripts/sys.sh hk disk
+bash skills/ssh/scripts/proc.sh hk top 30
+bash skills/ssh/scripts/net.sh hk ports 100
+bash skills/ssh/scripts/service.sh hk status caddy
+```
+
+Fleet:
 
 ```bash
 bash skills/ssh/scripts/runner.sh \
-  --target "tag=production,role=edge" \
+  --target "tag=production" \
   --cmd "uptime" \
   --parallel 20 \
   --timeout 30 \
   --fail-fast 20%
 ```
 
-`runner.sh` prints a compact JSON summary and stores detailed per-host results under:
+### 4. Reason from JSON results
+
+Read the compact summary first. For fleet runs, inspect failed hosts from:
 
 ```text
 .runs/<run_id>/results/<host>.json
 ```
 
-Audit events are written to:
+Audit logs are written to:
 
 ```text
 .audit/<YYYY-MM-DD>/<run_id>.jsonl
 ```
 
-### 4. Single-host commands
+### 5. Use write locks for coordinated changes
+
+For write operations that may overlap with other tasks:
 
 ```bash
-bash skills/ssh/scripts/connect.sh <host>
-bash skills/ssh/scripts/exec.sh <host> "command here"
+bash skills/ssh/scripts/lock.sh hk acquire --timeout 60 --run-id <run_id>
+# perform operation
+bash skills/ssh/scripts/lock.sh hk release --run-id <run_id>
 ```
 
-For multi-step operations, combine commands into one call:
+Do not make lock usage a rigid workflow for read-only operations.
+
+---
+
+## Linux Primitives
+
+### System observation
 
 ```bash
-bash skills/ssh/scripts/exec.sh prod "cd /app && git pull && npm install && pm2 restart app"
+bash skills/ssh/scripts/sys.sh <host> summary
+bash skills/ssh/scripts/sys.sh <host> disk
+bash skills/ssh/scripts/sys.sh <host> memory
+bash skills/ssh/scripts/sys.sh <host> load
+bash skills/ssh/scripts/sys.sh <host> journal [unit] [lines]
+bash skills/ssh/scripts/sys.sh <host> dmesg [lines]
+bash skills/ssh/scripts/sys.sh <host> users
 ```
 
-### 5. Service management
+### File operations
 
 ```bash
-bash skills/ssh/scripts/service.sh hk status caddy
-bash skills/ssh/scripts/service.sh hk logs caddy
-bash skills/ssh/scripts/service.sh hk restart caddy
+bash skills/ssh/scripts/file.sh <host> exists <path>
+bash skills/ssh/scripts/file.sh <host> stat <path>
+bash skills/ssh/scripts/file.sh <host> list <path> [limit]
+bash skills/ssh/scripts/file.sh <host> head <path> [lines]
+bash skills/ssh/scripts/file.sh <host> tail <path> [lines]
+bash skills/ssh/scripts/file.sh <host> grep <pattern> <path> [limit]
+bash skills/ssh/scripts/file.sh <host> checksum <path>
+bash skills/ssh/scripts/file.sh <host> backup <path>
+bash skills/ssh/scripts/file.sh <host> mkdir <path>
+bash skills/ssh/scripts/file.sh <host> remove <path> --confirm
 ```
 
-High-risk service operations such as stop/disable require explicit confirmation:
+### Process operations
 
 ```bash
-bash skills/ssh/scripts/service.sh hk stop caddy --confirm
+bash skills/ssh/scripts/proc.sh <host> top [limit]
+bash skills/ssh/scripts/proc.sh <host> mem [limit]
+bash skills/ssh/scripts/proc.sh <host> find <pattern> [limit]
+bash skills/ssh/scripts/proc.sh <host> tree [limit]
+bash skills/ssh/scripts/proc.sh <host> kill <pid> --confirm
 ```
 
-### 6. File transfer
+### Network operations
+
+```bash
+bash skills/ssh/scripts/net.sh <host> ports [limit]
+bash skills/ssh/scripts/net.sh <host> listen <port>
+bash skills/ssh/scripts/net.sh <host> curl <url> [limit]
+bash skills/ssh/scripts/net.sh <host> dns <name>
+bash skills/ssh/scripts/net.sh <host> route
+bash skills/ssh/scripts/net.sh <host> addr
+```
+
+### Package operations
+
+```bash
+bash skills/ssh/scripts/pkg.sh <host> detect
+bash skills/ssh/scripts/pkg.sh <host> search <name> [limit]
+bash skills/ssh/scripts/pkg.sh <host> installed <name>
+bash skills/ssh/scripts/pkg.sh <host> update-cache --confirm
+bash skills/ssh/scripts/pkg.sh <host> install <name> --confirm
+```
+
+### Service operations
+
+```bash
+bash skills/ssh/scripts/service.sh <host> status <service>
+bash skills/ssh/scripts/service.sh <host> logs <service>
+bash skills/ssh/scripts/service.sh <host> restart <service>
+bash skills/ssh/scripts/service.sh <host> stop <service> --confirm
+bash skills/ssh/scripts/service.sh <host> disable <service> --confirm
+```
+
+### File transfer
 
 ```bash
 bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/path /remote/path
 bash skills/ssh/scripts/scp_transfer.sh <host> download /remote/path /local/path
 ```
 
-If an upload target is busy, the script returns `target_busy` by default. Do not kill remote processes unless explicitly authorized:
+If a target file is busy, default behavior is to return `target_busy`. Only release busy processes with explicit authorization:
 
 ```bash
-bash skills/ssh/scripts/scp_transfer.sh hk upload ./caddy /usr/bin/caddy --force-release
+bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/file /remote/file --force-release
 ```
-
-### 7. Facts and patrol checks
-
-Collect lightweight host facts:
-
-```bash
-bash skills/ssh/scripts/facts.sh --target "tag=production" --parallel 20 --timeout 30
-```
-
-Run a patrol health check for disk usage and service activity:
-
-```bash
-bash skills/ssh/scripts/patrol.sh --target "tag=production,role=edge" --service caddy --disk-threshold 85 --parallel 20
-```
-
----
-
-## Directory Structure
-
-```text
-openclaw/skills/ssh/
-├── SKILL.md
-├── README.md
-├── _meta.json
-├── hosts.yaml                ← Host config, placeholders only, safe for git
-├── scripts/
-│   ├── common.sh             ← Shared config, JSON, redaction, policy, audit helpers
-│   ├── yaml.sh               ← Tiny hosts.yaml parser
-│   ├── connect.sh            ← Establish ControlMaster background connection
-│   ├── exec.sh               ← Execute commands via ControlMaster
-│   ├── runner.sh             ← Concurrent fleet runner for Agent operations
-│   ├── select_hosts.sh       ← Select hosts by tag/env/region/role/provider
-│   ├── facts.sh              ← Collect lightweight host facts
-│   ├── patrol.sh             ← Lightweight fleet health checks
-│   ├── service.sh            ← Service management wrapper
-│   ├── scp_transfer.sh       ← File upload/download
-│   ├── disconnect.sh         ← Close ControlMaster socket
-│   └── list_hosts.sh         ← List available hosts
-├── references/
-│   └── hosts_yaml_format.md
-├── .secrets/                 ← Sensitive credentials, not committed
-├── .runs/                    ← Runtime batch results, not committed
-├── .audit/                   ← Runtime audit logs, not committed
-└── .state/                   ← Future local state DB/cache, not committed
-```
-
----
-
-## Security Architecture
-
-**Dual-layer config**:
-
-- `hosts.yaml`: placeholders and non-secret metadata only — safe to share/commit
-- `.secrets/<host>.env`: real IPs, key paths, credentials — must not be committed
-
-Scripts read `hosts.yaml`, then override host and key path from `.secrets/<host>.env` or `.secrets/<alias-target>.env` when available.
-
-**Output redaction**:
-
-- `password=`, `passwd=`, `secret=`, `token=`, `api_key=` → `[REDACTED]`
-- IPv4 addresses → `[REDACTED_IP]`
-- common private-key paths → `[REDACTED_KEY_PATH]`
 
 ---
 
 ## Security Rules (MUST follow)
 
-1. **Never output credentials**: IPs, usernames, passwords, key paths, key contents must not appear in conversation.
-2. **Never read private key contents**: Reference keys by path only. Never `cat` or print private keys.
-3. **Never modify `.secrets/` from Agent commands** unless the user explicitly asks.
-4. **Prefer structured tools**: Use `service.sh`, `scp_transfer.sh`, `facts.sh`, `patrol.sh`, and `runner.sh` before free-form shell commands.
-5. **Use runner for fleets**: For more than a few hosts, use `runner.sh` with `--parallel`, `--timeout`, and preferably `--fail-fast`.
-6. **Confirm destructive commands**: High-risk commands require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
-7. **No sudo passwords**: Do not embed sudo passwords in commands. Suggest NOPASSWD sudoers or manual operation.
-8. **Truncate large outputs**: Add `head`, `tail`, or other limits to log/list commands.
-9. **Do not auto-kill busy processes**: File upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
-10. **Review summaries before follow-up actions**: After batch operations, inspect summary and failed hosts before remedial changes.
+1. **Never output credentials**: IPs, usernames, passwords, key paths, and key contents must not appear in conversation.
+2. **Never read private key contents**: reference keys by path only. Never `cat` private keys.
+3. **Never modify `.secrets/` from Agent commands** unless the user explicitly requests it.
+4. **Observe before changing**: for unclear problems, use `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, and `service.sh status/logs` before applying changes.
+5. **Use primitives first**: prefer `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh` over raw `exec.sh` when available.
+6. **Use runner for fleets**: for more than a few hosts, use `runner.sh` with `--parallel`, `--timeout`, and preferably `--fail-fast`.
+7. **Use locks for write operations**: when doing multi-step writes on a host, use `lock.sh acquire/release`.
+8. **Confirm destructive commands**: high-risk operations require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
+9. **No sudo passwords**: do not embed sudo passwords in commands. Suggest NOPASSWD sudoers or manual operation.
+10. **Truncate large outputs**: use limits in primitives or add `head`/`tail` to raw commands.
+11. **Do not auto-kill busy processes**: file upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
+12. **Review summaries before follow-up actions**: for batch runs, inspect failed hosts before remediation.
 
 ---
 
 ## Policy Guard
 
-High-risk commands are blocked unless explicitly confirmed. Examples:
+The skill keeps guardrails minimal so Agent autonomy is preserved. It blocks only clearly risky operations unless explicitly confirmed.
+
+High-risk examples:
 
 - `rm -rf /`
 - `mkfs`
@@ -273,7 +295,7 @@ find / -name "*.log" | head -30
 ps aux | head -50
 ```
 
-Use `tail -N` for logs and `head -N` for long lists. Keep N around 50-200.
+Use primitive limits where possible.
 
 ---
 
@@ -289,4 +311,5 @@ Use `tail -N` for logs and `head -N` for long lists. Keep N around 50-200.
 | ControlMaster socket expired | Auto re-run `connect.sh`, then retry |
 | `policy_blocked` | Ask for explicit confirmation before continuing |
 | `target_busy` | Ask whether to retry with `--force-release` |
+| `lock_owned_by_other` | Wait, inspect lock status, or ask before force unlock |
 | Command `exit_code != 0` | Return JSON result and summarize failed hosts |
