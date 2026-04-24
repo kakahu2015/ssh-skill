@@ -1,13 +1,16 @@
 {
   "name": "ssh",
-  "version": "1.0.0",
-  "description": "SSH 远程登录与交互式会话技能，ControlMaster 复用连接，纯 bash 无外部依赖。",
+  "version": "1.1.0",
+  "description": "Agent-native SSH 运维执行层，ControlMaster 复用连接，支持批量并发、策略拦截、审计记录，纯 bash 低依赖。",
   "author": "kakahu2015",
   "license": "MIT",
-  "keywords": ["ssh", "remote", "server", "scp", "vps", "devops"],
+  "keywords": ["ssh", "remote", "server", "scp", "vps", "devops", "agent", "batch"],
   "categories": ["devops", "server"],
   "requires": {
-    "bins": ["ssh"]
+    "bins": ["ssh", "scp"]
+  },
+  "optional": {
+    "bins": ["sshpass", "timeout"]
   },
   "minClawVersion": "0.1.0"
 }
