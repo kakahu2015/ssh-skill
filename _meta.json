@@ -1,7 +1,9 @@
 {
   "name": "linux-ops",
-  "version": "1.2.0",
-  "description": "Agent-native Linux 操作 skill，通过 SSH 提供系统、文件、进程、网络、包管理、服务、传输、锁等可组合 primitives，并支持批量并发、策略拦截、脱敏和审计。",
+  "version": "1.3.0",
+  "description": "Agent-native Linux 操作 skill，通过 SSH 提供系统、文件、进程、网络、包管理、服务、传输、锁等可组合 primitives，并支持批量并发、策略拦截、脱敏、审计、显式 sudo 重试和 inventory 校验。",
+  "description_en": "Agent-native Linux operations skill over SSH, providing composable primitives for system, file, process, network, package, service, transfer, and lock operations, with batch execution, policy guardrails, output redaction, audit logs, explicit sudo retry, and inventory validation.",
+  "about_en": "Agent-native SSH/Linux ops skill with composable primitives, batch execution, safety guardrails, redaction, audit logs, explicit sudo retry, and inventory validation.",
   "author": "kakahu2015",
   "license": "MIT",
   "keywords": ["linux", "ssh", "remote", "server", "scp", "vps", "devops", "agent", "batch", "ops"],
