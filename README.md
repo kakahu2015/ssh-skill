@@ -1,5 +1,7 @@
 # SSH/Linux Ops Skill (Agent-native)
 
+[中文 v1.3.0 安全加固说明](docs/ssh-skill-v1.3.0-hardening.zh-CN.md) | [English v1.3.0 Safety Hardening Notes](docs/ssh-skill-v1.3.0-hardening.md)
+
 OpenClaw 的通用 Linux 运维 skill，基于系统 `ssh` + ControlMaster，为 AI Agent 提供一组 **可组合、可审计、可批量执行的 Linux 操作 primitives**。
 
 目标不是把 Ansible playbook 换成 bash playbook，而是给 Agent 一套安全的 Linux 操作积木：Agent 自己观察、推理、选择下一步；skill 负责连接、执行、批量、脱敏、策略拦截、审计和结果落盘。
