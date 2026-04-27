@@ -37,7 +37,7 @@ check_and_release_file() {
         if [[ "$FORCE_RELEASE" != "--force-release" && "${SSH_SKILL_FORCE_RELEASE:-}" != "yes" ]]; then
             die_json "target_busy" "目标文件被进程占用，未自动释放。需要显式追加 --force-release 或设置 SSH_SKILL_FORCE_RELEASE=yes: $remote_file" "$HOST_NAME"
         fi
-        policy_check_command "sudo fuser -k $quoted" 1 "--confirm"
+        policy_check_command "sudo fuser -k $quoted" 1 "--confirm" "$HOST_NAME"
         echo "[ssh-skill] 检测到目标文件被占用，按显式授权释放..." >&2
         run_remote_raw "sudo fuser -k $quoted 2>/dev/null; sleep 1" >/dev/null 2>&1 || true
     fi
@@ -78,14 +78,14 @@ write_audit_event "$RUN_ID" "$HOST_NAME" "scp_$DIRECTION" "$SUCCESS" "$RC" "$DUR
 cat <<JSON
 {
   "success": $SUCCESS,
-  "run_id": "$(json_escape "$RUN_ID")",
-  "host": "$(json_escape "$HOST_NAME")",
-  "operation": "$(json_escape "$DIRECTION")",
+  "run_id": "$(safe_json_string "$RUN_ID")",
+  "host": "$(safe_json_string "$HOST_NAME")",
+  "operation": "$(safe_json_string "$DIRECTION")",
   "exit_code": $RC,
   "duration_ms": $DURATION_MS,
-  "src": "$(json_escape "$SRC")",
-  "dst": "$(json_escape "$DST")",
-  "stderr": "$(json_escape "$SCP_OUT")"
+  "src": "$(safe_json_string "$SRC")",
+  "dst": "$(safe_json_string "$DST")",
+  "stderr": "$(safe_json_string "$SCP_OUT")"
 }
 JSON
 exit "$RC"
