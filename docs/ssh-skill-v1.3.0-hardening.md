@@ -1,5 +1,7 @@
 # SSH/Linux Ops Skill v1.3.0 — Safety Hardening Update
 
+[中文](ssh-skill-v1.3.0-hardening.zh-CN.md) | [English](ssh-skill-v1.3.0-hardening.md)
+
 This update hardens the SSH/Linux Ops Skill around inventory hygiene, command safety, sudo behavior, output redaction, and CI validation.
 
 ## Key Changes
