@@ -13,7 +13,7 @@ jobs:
       - name: Syntax check
         run: |
           bash -n scripts/*.sh tests/*.sh
-          python3 -m py_compile scripts/validate_decision.py scripts/validate_autonomy.py
+          python3 -m py_compile scripts/validate_decision.py scripts/validate_autonomy.py scripts/agent_gate.py scripts/redact.py
       - name: Validate example inventory
         run: bash scripts/validate_hosts.sh hosts.example.yaml
       - name: Validate autonomy policy example

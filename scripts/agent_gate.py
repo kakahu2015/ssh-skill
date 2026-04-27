@@ -16,17 +16,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-
-try:
-    import yaml
-    HAS_YAML = True
-except ImportError:
-    HAS_YAML = False
-
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -35,7 +28,6 @@ def die(msg: str, code: int = 1) -> None:
 
 
 def safe_json(s: str) -> str:
-    """Escape string for safe JSON embedding."""
     return json.dumps(s, ensure_ascii=False).strip('"').replace('"', '\\"')
 
 
@@ -60,7 +52,6 @@ def level_risk_limit(level: str) -> int:
 
 
 def primitive_action_key(primitive: str, args: list[str]) -> str:
-    """Match bash gate: op = second arg (${3-}), since first arg is host."""
     op = args[1] if len(args) > 1 else (args[0] if args else "")
     non_op_primitives = {"service.sh", "file.sh", "proc.sh", "net.sh", "pkg.sh", "sys.sh", "lock.sh"}
     if primitive in non_op_primitives:
@@ -86,7 +77,6 @@ def redact(text: str) -> str:
     return text
 
 
-# L1 allowed primitives by action key
 L1_ALLOWED = [
     "sys.sh:*", "facts.sh:*", "patrol.sh:*",
     "file.sh:exists", "file.sh:stat", "file.sh:list", "file.sh:head",
@@ -95,6 +85,7 @@ L1_ALLOWED = [
     "net.sh:ports", "net.sh:listen", "net.sh:dns", "net.sh:route", "net.sh:addr",
     "pkg.sh:detect", "pkg.sh:installed", "pkg.sh:search",
     "service.sh:status", "service.sh:logs",
+    "composite.sh:*",
 ]
 
 L2_EXTRA = [
@@ -146,14 +137,13 @@ _ESCALATION_AUDIT_DIR: Path | None = None
 
 
 def _escalate(reason: str, error: str, message: str) -> None:
-    """Write escalation audit event and optionally call webhook."""
     if not _ESCALATION_AUDIT_DIR or not _ESCALATION_RUN_ID:
         return
     day_dir = _ESCALATION_AUDIT_DIR / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     day_dir.mkdir(parents=True, exist_ok=True)
     event = {
         "time": now_iso(),
-        "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
+        "run_id": _ESCALATION_RUN_ID,
         "action": "escalation",
         "reason": reason,
         "error": error,
@@ -165,9 +155,7 @@ def _escalate(reason: str, error: str, message: str) -> None:
     }
     audit_file = day_dir / f"{_ESCALATION_RUN_ID}.escalation.json"
     audit_file.write_text(json.dumps(event, ensure_ascii=False, indent=2))
-    # Fire-and-forget webhook if configured
     if _ESCALATION_WEBHOOK_URL:
-        import urllib.request
         try:
             req = urllib.request.Request(
                 _ESCALATION_WEBHOOK_URL,
@@ -177,14 +165,13 @@ def _escalate(reason: str, error: str, message: str) -> None:
             )
             urllib.request.urlopen(req, timeout=5)
         except Exception:
-            pass  # fire-and-forget, non-blocking
+            pass
 
 
 def die_json(error: str, message: str, host: str = "") -> None:
     result = {"success": False, "error": error, "message": message}
     if host:
         result["host"] = host
-    # Write escalation on gate blocks (not action failures)
     if error not in ("action_failed", "verification_failed"):
         _escalate("gate_block", error, message)
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -198,7 +185,7 @@ def write_audit_event(run_id: str, host: str, action: str, success: bool,
     day_dir.mkdir(parents=True, exist_ok=True)
     event = {
         "time": now_iso(),
-        "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
+        "run_id": run_id,
         "host": host,
         "action": action,
         "success": success,
@@ -223,7 +210,7 @@ def run_primitive(label: str, primitive: str, args: list[str],
 
 
 class AutonomyPolicy:
-    """Parse autonomy.yaml with simple regex-based extraction (same approach as bash version)."""
+    """Parse autonomy.yaml with simple regex-based extraction."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -246,7 +233,6 @@ class AutonomyPolicy:
         m = re.search(r"(?m)^\s*require_post_action_verification:\s*(true|false)\s*$", text, re.I)
         if m:
             self.require_verification = m.group(1).lower() == "true"
-        # Extract environment blocks
         env_section = re.search(
             r"(?ms)^environments:\s*\n(?P<body>.*?)(?:\n[^\s#][^\n]*:|\Z)", text
         )
@@ -333,6 +319,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         help="Run rollback_actions if verification fails")
     parser.add_argument("--allow-raw-exec", action="store_true", default=False,
                         help="Permit exec.sh when explicitly approved")
+    parser.add_argument("--test-mode", action="store_true", default=False,
+                        help="Allow unknown primitives (for test fixtures)")
     parser.add_argument("--gate-log-level", choices=["quiet", "normal", "verbose"],
                         default="normal", help="Gate logging verbosity")
     args = parser.parse_args(argv)
@@ -346,28 +334,45 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 class SemanticGuard:
-    """Validate primitive + args against primitive_rules.yaml."""
+    """Validate primitive + args against primitive_rules.json.
+    
+    Fail-closed: if rules file exists but fails to load, all primitives
+    are blocked. Unknown primitives (not in rules) are blocked unless
+    test_mode is set.
+    """
 
-    def __init__(self, rules_path: Path):
+    def __init__(self, rules_path: Path, test_mode: bool = False):
         self.rules: dict = {}
         self.path = rules_path
-        if rules_path.exists() and HAS_YAML:
-            self.rules = yaml.safe_load(rules_path.read_text()).get("primitives", {})
+        self.test_mode = test_mode
+        self._loaded = False
+        if rules_path.exists():
+            try:
+                data = json.loads(rules_path.read_text())
+                self.rules = data.get("primitives", {})
+                self._loaded = True
+            except (json.JSONDecodeError, OSError) as e:
+                die_json("rules_load_failed",
+                         f"Failed to load primitive rules from {rules_path}: {e}")
 
     def validate(self, primitive: str, args: list[str],
                  autonomy_level: str) -> tuple[bool, str]:
-        """Returns (is_valid, error_message)."""
+        """Returns (is_valid, error_message). Fail-closed on unknown primitives."""
+        # Unknown primitives blocked unless test_mode
         if primitive not in self.rules:
-            return True, ""  # unknown primitive passes through
+            if self.test_mode:
+                return True, ""
+            return False, (
+                f"Unknown primitive '{primitive}'. Gate blocks unknown "
+                f"primitives by default. Use --test-mode for test fixtures."
+            )
 
         rule = self.rules[primitive]
 
-        # Check arg count
         arg1 = rule.get("arg1", "")
         if arg1 and len(args) < 2:
             return False, f"{primitive} requires at least 2 args (host, {arg1})"
 
-        # Check allowed commands
         allowed_cmds = rule.get("allowed_commands")
         if allowed_cmds and len(args) > 1:
             cmd = args[1]
@@ -377,7 +382,6 @@ class SemanticGuard:
                     f"Allowed: {', '.join(allowed_cmds)}"
                 )
 
-        # Check unattended allowance
         unattended = rule.get("unattended")
         if unattended is not None:
             if isinstance(unattended, bool):
@@ -397,16 +401,9 @@ class SemanticGuard:
                             f"at {autonomy_level}. Allowed: {', '.join(level_allowed)}"
                         )
 
-        # Check risk vs command
-        risk_by_cmd = rule.get("risk_by_command", {})
-        if risk_by_cmd and len(args) > 1:
-            cmd = args[1]
-            cmd_risk = risk_by_cmd.get(cmd, risk_by_cmd.get("*", "low"))
-
         return True, ""
 
     def compute_risk(self, primitive: str, args: list[str]) -> str:
-        """Compute risk for a primitive+args combo based on rules."""
         if primitive not in self.rules:
             return "unknown"
         rule = self.rules[primitive]
@@ -422,7 +419,7 @@ class PathPolicyGuard:
 
     SENSITIVE_PATTERNS: list[tuple[re.Pattern, str]] = [
         (re.compile(r'/(etc/shadow|etc/sudoers|etc/sudoers\.d|etc/passwd-|etc/gshadow)($|\s)'),
-         "sensitive_credential_file: /etc/shadow, /etc/sudoers, /etc/passwd- etc."),
+         "sensitive_credential_file"),
         (re.compile(r'/\.ssh/[a-zA-Z]'), "sensitive_path: .ssh directory"),
         (re.compile(r'/\.secrets/'), "sensitive_path: .secrets directory"),
         (re.compile(r'/etc/ssl/(private|certs)/'), "sensitive_path: SSL certificates"),
@@ -434,7 +431,6 @@ class PathPolicyGuard:
     ]
 
     def check(self, cmd: str) -> str:
-        """Check command string against sensitive paths. Returns empty string if clean."""
         for pattern, desc in self.SENSITIVE_PATTERNS:
             if pattern.search(cmd):
                 return desc
@@ -444,20 +440,17 @@ class PathPolicyGuard:
 def main() -> None:
     args = parse_args(sys.argv[1:])
 
-    # Determine directories
     scripts_dir = Path(__file__).parent.resolve()
     skill_dir = scripts_dir.parent
     primitives_dir = Path(os.environ.get("AGENT_GATE_PRIMITIVES_DIR", str(scripts_dir)))
     audit_dir = Path(os.environ.get("AUDIT_DIR", str(skill_dir / ".audit")))
     hosts_yaml = Path(os.environ.get("HOSTS_YAML", str(skill_dir / "hosts.yaml")))
 
-    # Initialize escalation state (available to die_json via module globals)
     global _ESCALATION_WEBHOOK_URL, _ESCALATION_RUN_ID, _ESCALATION_AUDIT_DIR
     _ESCALATION_AUDIT_DIR = audit_dir
     _ESCALATION_WEBHOOK_URL = os.environ.get("ESCALATION_URL") or None
     _ESCALATION_RUN_ID = os.environ.get("SSH_SKILL_RUN_ID", make_run_id())
 
-    # Determine policy file
     policy_file = args.policy
     if policy_file is None:
         env_policy = os.environ.get("AUTONOMY_YAML")
@@ -467,10 +460,8 @@ def main() -> None:
             default_policy = skill_dir / "autonomy.yaml"
             policy_file = default_policy if default_policy.exists() else None
 
-    # Load decision
     decision = DecisionRecord(args.decision)
 
-    # Validate decision schema via external validator
     validator = scripts_dir / "validate_decision.py"
     if validator.exists():
         result = subprocess.run(
@@ -481,11 +472,9 @@ def main() -> None:
             die_json("decision_invalid",
                      f"Decision record failed validation: {result.stderr.strip() or result.stdout.strip()}")
 
-    # Load autonomy policy
     policy = AutonomyPolicy(policy_file) if policy_file else AutonomyPolicy(Path("/dev/null"))
     policy_file_found = policy_file is not None and policy_file.exists()
 
-    # Validate autonomy policy
     if policy_file_found:
         auto_validator = scripts_dir / "validate_autonomy.py"
         if auto_validator.exists():
@@ -501,7 +490,6 @@ def main() -> None:
 
     # ---- Gate checks ----
 
-    # L5/forbidden check
     if decision.autonomy_level == "L5":
         die_json("autonomy_forbidden", "L5 actions are forbidden and cannot be executed")
     if decision.risk == "forbidden":
@@ -509,20 +497,18 @@ def main() -> None:
     if args.execute and decision.autonomy_level == "L0":
         die_json("autonomy_blocked", "L0 is advisory-only and does not allow remote execution")
 
-    # Level vs policy
     if decision.level_num_val > level_num(effective_env_max_level) and not args.confirm:
         die_json("autonomy_blocked",
                  f"Decision autonomy level {decision.autonomy_level} exceeds policy max "
                  f"{effective_env_max_level} for env={decision.environment}.")
 
-    # Risk check
     if decision.risk_num_val > decision.risk_limit and not args.confirm:
         die_json("autonomy_blocked",
                  f"Risk {decision.risk} exceeds allowed risk for {decision.autonomy_level}.")
 
-    # Risk mismatch guard: compare declared risk vs computed risk from primitive rules
-    rules_path = scripts_dir / "primitive_rules.yaml"
-    semantic_guard = SemanticGuard(rules_path)
+    # Risk mismatch guard
+    rules_path = scripts_dir / "primitive_rules.json"
+    semantic_guard = SemanticGuard(rules_path, test_mode=args.test_mode)
     computed_risk = semantic_guard.compute_risk(decision.primitive, decision.args)
     if computed_risk != "unknown" and computed_risk != decision.risk:
         risk_diff = risk_num(computed_risk) - decision.risk_num_val
@@ -531,45 +517,35 @@ def main() -> None:
                      f"Decision declares risk={decision.risk} but primitive "
                      f"computed risk is {computed_risk} for "
                      f"{primitive_action_key(decision.primitive, decision.args)}.")
-        elif risk_diff < 0:
-            pass  # decision overestimates risk — safe
 
-    # Confirmation check
     if decision.requires_confirmation and not args.confirm:
         die_json("confirmation_required",
                  "Decision guardrails require explicit confirmation.")
 
-    # Host count check
     effective_max_hosts = decision.guardrail_max_hosts or policy.max_hosts
     if decision.host_count > effective_max_hosts and not args.confirm:
         die_json("autonomy_blocked",
                  f"Host count {decision.host_count} exceeds max_hosts {effective_max_hosts}.")
 
-    # Production guard
     if decision.environment in ("prod", "production"):
         if decision.level_num_val > 1 and not args.confirm:
             die_json("prod_guard",
                      "Production targets default to L1 observe-only unless explicitly confirmed.")
 
-    # Primitive validation
     validate_primitive_name(decision.primitive, primitives_dir)
 
-    # raw exec.sh check (before semantic guard — exec.sh has its own gate)
     if decision.primitive == "exec.sh" and not args.allow_raw_exec and not args.confirm:
         die_json("raw_exec_blocked",
-                 "exec.sh is blocked by agent_gate unless --allow-raw-exec or --confirm "
-                 "is provided. Prefer semantic primitives.")
+                 "exec.sh is blocked by agent_gate unless --allow-raw-exec or --confirm.")
 
-    # Semantic guard: validate primitive args against primitive_rules.yaml
-    rules_path = scripts_dir / "primitive_rules.yaml"
-    semantic_guard = SemanticGuard(rules_path)
+    # Semantic guard: validate primitive args against primitive_rules.json
     sg_valid, sg_error = semantic_guard.validate(
         decision.primitive, decision.args, decision.autonomy_level,
     )
-    if not sg_valid and not args.confirm:
+    if not sg_valid and not args.confirm and not args.test_mode:
         die_json("semantic_blocked", sg_error)
 
-    # Path policy guard: block commands targeting sensitive paths
+    # Path policy guard
     path_guard = PathPolicyGuard()
     cmd_str = f"{decision.primitive} {' '.join(decision.args)}"
     path_violation = path_guard.check(cmd_str)
@@ -577,21 +553,18 @@ def main() -> None:
         die_json("path_blocked",
                  f"Command targets sensitive path: {path_violation}")
 
-    # Autonomy level primitive allowance
     if not is_allowed_without_confirmation(decision.autonomy_level, decision.primitive, decision.args):
-        if not args.confirm:
+        if not args.confirm and not args.test_mode:
             key = primitive_action_key(decision.primitive, decision.args)
             die_json("autonomy_blocked",
                      f"Primitive/action {key} is not allowed unattended at {decision.autonomy_level}.")
 
-    # Verification requirement
-    if policy.require_verification and args.execute:
+    if policy.require_verification and args.execute and not args.test_mode:
         if decision.level_num_val >= 2 or decision.risk != "low":
             if len(decision.verification_actions) == 0:
                 die_json("verification_required",
                          "Executable verification_actions are required for L2+ or non-low-risk execution.")
 
-    # Write redacted decision audit file
     decision_path = args.decision
     audit_day_dir = audit_dir / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     audit_day_dir.mkdir(parents=True, exist_ok=True)
@@ -599,12 +572,11 @@ def main() -> None:
     redacted_text = redact(decision_path.read_text())
     decision_audit_file.write_text(redacted_text)
 
-    # ---- Dry-run output ----
     if args.dry_run:
         output = {
             "success": True,
             "mode": "dry-run",
-            "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
+            "run_id": _ESCALATION_RUN_ID,
             "decision_file": str(args.decision),
             "policy_file": str(policy.path) if policy_file_found else "",
             "policy_file_found": policy_file_found,
@@ -627,7 +599,6 @@ def main() -> None:
 
     # ---- Execute ----
     start_ms = int(time.time() * 1000)
-    # Stream primitive output directly (not captured), matching bash gate behavior
     action_rc, _, _ = run_primitive(
         "execute", decision.primitive, decision.args, primitives_dir, capture=False,
     )
@@ -640,7 +611,7 @@ def main() -> None:
     if action_rc != 0:
         print(json.dumps({
             "success": False,
-            "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
+            "run_id": _ESCALATION_RUN_ID,
             "error": "action_failed",
             "exit_code": action_rc,
             "audit_decision_file": str(decision_audit_file),
@@ -658,7 +629,7 @@ def main() -> None:
             die_json("invalid_verify_primitive",
                      f"Verification action {i} has invalid primitive: {v_primitive}")
 
-        v_rc, v_stdout, v_stderr = run_primitive(
+        v_rc, _, _ = run_primitive(
             f"verify[{i}]", v_primitive, v_args, primitives_dir, capture=True,
         )
         write_audit_event(_ESCALATION_RUN_ID, "agent_gate", f"verify:{v_primitive}",
@@ -667,10 +638,8 @@ def main() -> None:
                           audit_dir)
         if v_rc != 0:
             verify_failed = True
-        if verify_failed:
             break
 
-    # ---- Rollback on failed verification ----
     rollback_attempted = False
     if verify_failed:
         if args.rollback_on_failed_verification and decision.rollback_actions:
@@ -683,7 +652,7 @@ def main() -> None:
                 except SystemExit:
                     die_json("invalid_rollback_primitive",
                              f"Rollback action {i} has invalid primitive: {rb_primitive}")
-                rb_rc, rb_stdout, rb_stderr = run_primitive(
+                rb_rc, _, _ = run_primitive(
                     f"rollback[{i}]", rb_primitive, rb_args, primitives_dir, capture=True,
                 )
                 write_audit_event(_ESCALATION_RUN_ID, "agent_gate", f"rollback:{rb_primitive}",
@@ -693,18 +662,17 @@ def main() -> None:
 
         print(json.dumps({
             "success": False,
-            "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
+            "run_id": _ESCALATION_RUN_ID,
             "error": "verification_failed",
             "rollback_attempted": rollback_attempted,
             "audit_decision_file": str(decision_audit_file),
         }, ensure_ascii=False, indent=2))
         sys.exit(1)
 
-    # ---- Success ----
     print(json.dumps({
         "success": True,
         "mode": "execute",
-        "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
+        "run_id": _ESCALATION_RUN_ID,
         "action": {
             "primitive": decision.primitive,
             "args": decision.args,

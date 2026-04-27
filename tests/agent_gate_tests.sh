@@ -211,7 +211,7 @@ MOCK_OK_DECISION="$TMP_DIR/mock-ok.json"
 write_mock_decision "$MOCK_OK_DECISION" "generic_success.sh" "generic_success.sh" "generic_rollback.sh"
 expect_success \
   "agent_gate execute success with verification success" \
-  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_OK_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --confirm
+  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_OK_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --test-mode
 
 : > "$AGENT_GATE_TEST_STATE"
 MOCK_VERIFY_FAIL_DECISION="$TMP_DIR/mock-verify-fail.json"
@@ -219,7 +219,7 @@ write_mock_decision "$MOCK_VERIFY_FAIL_DECISION" "generic_success.sh" "generic_f
 expect_failure_contains \
   "agent_gate runs rollback when verification fails" \
   "verification_failed" \
-  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_VERIFY_FAIL_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --confirm --rollback-on-failed-verification
+  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_VERIFY_FAIL_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --test-mode --rollback-on-failed-verification
 if grep -q '^rollback:rollback$' "$AGENT_GATE_TEST_STATE"; then
   pass "rollback primitive recorded state"
 else
@@ -233,6 +233,6 @@ write_mock_decision "$MOCK_ACTION_FAIL_DECISION" "generic_fail.sh" "generic_succ
 expect_failure_contains \
   "agent_gate stops on primary action failure" \
   "action_failed" \
-  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_ACTION_FAIL_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --confirm
+  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_ACTION_FAIL_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --test-mode
 
 log "Completed $pass_count generic agent gate tests"
