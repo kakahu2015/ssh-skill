@@ -139,10 +139,54 @@ def validate_primitive_name(primitive: str, primitives_dir: Path) -> None:
         die_json("unknown_primitive", f"Primitive not found: {primitive}")
 
 
+# Module-level state for escalation
+_ESCALATION_WEBHOOK_URL: str | None = None
+_ESCALATION_RUN_ID: str | None = None
+_ESCALATION_AUDIT_DIR: Path | None = None
+
+
+def _escalate(reason: str, error: str, message: str) -> None:
+    """Write escalation audit event and optionally call webhook."""
+    if not _ESCALATION_AUDIT_DIR or not _ESCALATION_RUN_ID:
+        return
+    day_dir = _ESCALATION_AUDIT_DIR / datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+    event = {
+        "time": now_iso(),
+        "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
+        "action": "escalation",
+        "reason": reason,
+        "error": error,
+        "message": message,
+        "success": False,
+        "exit_code": 0,
+        "duration_ms": 0,
+        "command": "",
+    }
+    audit_file = day_dir / f"{_ESCALATION_RUN_ID}.escalation.json"
+    audit_file.write_text(json.dumps(event, ensure_ascii=False, indent=2))
+    # Fire-and-forget webhook if configured
+    if _ESCALATION_WEBHOOK_URL:
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                _ESCALATION_WEBHOOK_URL,
+                data=json.dumps(event, ensure_ascii=False).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # fire-and-forget, non-blocking
+
+
 def die_json(error: str, message: str, host: str = "") -> None:
     result = {"success": False, "error": error, "message": message}
     if host:
         result["host"] = host
+    # Write escalation on gate blocks (not action failures)
+    if error not in ("action_failed", "verification_failed"):
+        _escalate("gate_block", error, message)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     sys.exit(1)
 
@@ -154,7 +198,7 @@ def write_audit_event(run_id: str, host: str, action: str, success: bool,
     day_dir.mkdir(parents=True, exist_ok=True)
     event = {
         "time": now_iso(),
-        "run_id": run_id,
+        "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
         "host": host,
         "action": action,
         "success": success,
@@ -355,14 +399,46 @@ class SemanticGuard:
 
         # Check risk vs command
         risk_by_cmd = rule.get("risk_by_command", {})
-        risk_by_args = rule.get("risk_by_args", {})
         if risk_by_cmd and len(args) > 1:
             cmd = args[1]
             cmd_risk = risk_by_cmd.get(cmd, risk_by_cmd.get("*", "low"))
-            if cmd_risk == "high":
-                pass  # will be caught by gate risk check
 
         return True, ""
+
+    def compute_risk(self, primitive: str, args: list[str]) -> str:
+        """Compute risk for a primitive+args combo based on rules."""
+        if primitive not in self.rules:
+            return "unknown"
+        rule = self.rules[primitive]
+        risk_by_cmd = rule.get("risk_by_command", {})
+        if risk_by_cmd and len(args) > 1:
+            cmd = args[1]
+            return risk_by_cmd.get(cmd, risk_by_cmd.get("*", "low"))
+        return rule.get("risk", "low")
+
+
+class PathPolicyGuard:
+    """Block commands that target sensitive filesystem paths."""
+
+    SENSITIVE_PATTERNS: list[tuple[re.Pattern, str]] = [
+        (re.compile(r'/(etc/shadow|etc/sudoers|etc/sudoers\.d|etc/passwd-|etc/gshadow)($|\s)'),
+         "sensitive_credential_file: /etc/shadow, /etc/sudoers, /etc/passwd- etc."),
+        (re.compile(r'/\.ssh/[a-zA-Z]'), "sensitive_path: .ssh directory"),
+        (re.compile(r'/\.secrets/'), "sensitive_path: .secrets directory"),
+        (re.compile(r'/etc/ssl/(private|certs)/'), "sensitive_path: SSL certificates"),
+        (re.compile(r'/etc/kubernetes/'), "sensitive_path: Kubernetes config"),
+        (re.compile(r'/var/lib/kubelet/'), "sensitive_path: Kubelet data"),
+        (re.compile(r'/var/log/audit/'), "sensitive_path: audit logs"),
+        (re.compile(r'/etc/docker/certs\.d/'), "sensitive_path: Docker certs"),
+        (re.compile(r'/root/\.'), "sensitive_path: root dotfiles"),
+    ]
+
+    def check(self, cmd: str) -> str:
+        """Check command string against sensitive paths. Returns empty string if clean."""
+        for pattern, desc in self.SENSITIVE_PATTERNS:
+            if pattern.search(cmd):
+                return desc
+        return ""
 
 
 def main() -> None:
@@ -374,6 +450,12 @@ def main() -> None:
     primitives_dir = Path(os.environ.get("AGENT_GATE_PRIMITIVES_DIR", str(scripts_dir)))
     audit_dir = Path(os.environ.get("AUDIT_DIR", str(skill_dir / ".audit")))
     hosts_yaml = Path(os.environ.get("HOSTS_YAML", str(skill_dir / "hosts.yaml")))
+
+    # Initialize escalation state (available to die_json via module globals)
+    global _ESCALATION_WEBHOOK_URL, _ESCALATION_RUN_ID, _ESCALATION_AUDIT_DIR
+    _ESCALATION_AUDIT_DIR = audit_dir
+    _ESCALATION_WEBHOOK_URL = os.environ.get("ESCALATION_URL") or None
+    _ESCALATION_RUN_ID = os.environ.get("SSH_SKILL_RUN_ID", make_run_id())
 
     # Determine policy file
     policy_file = args.policy
@@ -438,6 +520,20 @@ def main() -> None:
         die_json("autonomy_blocked",
                  f"Risk {decision.risk} exceeds allowed risk for {decision.autonomy_level}.")
 
+    # Risk mismatch guard: compare declared risk vs computed risk from primitive rules
+    rules_path = scripts_dir / "primitive_rules.yaml"
+    semantic_guard = SemanticGuard(rules_path)
+    computed_risk = semantic_guard.compute_risk(decision.primitive, decision.args)
+    if computed_risk != "unknown" and computed_risk != decision.risk:
+        risk_diff = risk_num(computed_risk) - decision.risk_num_val
+        if risk_diff > 0 and not args.confirm:
+            die_json("risk_mismatch",
+                     f"Decision declares risk={decision.risk} but primitive "
+                     f"computed risk is {computed_risk} for "
+                     f"{primitive_action_key(decision.primitive, decision.args)}.")
+        elif risk_diff < 0:
+            pass  # decision overestimates risk — safe
+
     # Confirmation check
     if decision.requires_confirmation and not args.confirm:
         die_json("confirmation_required",
@@ -473,6 +569,14 @@ def main() -> None:
     if not sg_valid and not args.confirm:
         die_json("semantic_blocked", sg_error)
 
+    # Path policy guard: block commands targeting sensitive paths
+    path_guard = PathPolicyGuard()
+    cmd_str = f"{decision.primitive} {' '.join(decision.args)}"
+    path_violation = path_guard.check(cmd_str)
+    if path_violation and not args.confirm:
+        die_json("path_blocked",
+                 f"Command targets sensitive path: {path_violation}")
+
     # Autonomy level primitive allowance
     if not is_allowed_without_confirmation(decision.autonomy_level, decision.primitive, decision.args):
         if not args.confirm:
@@ -487,13 +591,11 @@ def main() -> None:
                 die_json("verification_required",
                          "Executable verification_actions are required for L2+ or non-low-risk execution.")
 
-    run_id = os.environ.get("SSH_SKILL_RUN_ID", make_run_id())
-
     # Write redacted decision audit file
     decision_path = args.decision
     audit_day_dir = audit_dir / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     audit_day_dir.mkdir(parents=True, exist_ok=True)
-    decision_audit_file = audit_day_dir / f"{run_id}.decision.json"
+    decision_audit_file = audit_day_dir / f"{_ESCALATION_RUN_ID}.decision.json"
     redacted_text = redact(decision_path.read_text())
     decision_audit_file.write_text(redacted_text)
 
@@ -502,7 +604,7 @@ def main() -> None:
         output = {
             "success": True,
             "mode": "dry-run",
-            "run_id": run_id,
+            "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
             "decision_file": str(args.decision),
             "policy_file": str(policy.path) if policy_file_found else "",
             "policy_file_found": policy_file_found,
@@ -530,7 +632,7 @@ def main() -> None:
         "execute", decision.primitive, decision.args, primitives_dir, capture=False,
     )
     duration_ms = int(time.time() * 1000) - start_ms
-    write_audit_event(run_id, "agent_gate", f"execute:{decision.primitive}",
+    write_audit_event(_ESCALATION_RUN_ID, "agent_gate", f"execute:{decision.primitive}",
                       action_rc == 0, action_rc, duration_ms,
                       f"{decision.primitive} {' '.join(shlex.quote(a) for a in decision.args)}",
                       audit_dir)
@@ -538,7 +640,7 @@ def main() -> None:
     if action_rc != 0:
         print(json.dumps({
             "success": False,
-            "run_id": run_id,
+            "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
             "error": "action_failed",
             "exit_code": action_rc,
             "audit_decision_file": str(decision_audit_file),
@@ -559,7 +661,7 @@ def main() -> None:
         v_rc, v_stdout, v_stderr = run_primitive(
             f"verify[{i}]", v_primitive, v_args, primitives_dir, capture=True,
         )
-        write_audit_event(run_id, "agent_gate", f"verify:{v_primitive}",
+        write_audit_event(_ESCALATION_RUN_ID, "agent_gate", f"verify:{v_primitive}",
                           v_rc == 0, v_rc, 0,
                           f"{v_primitive} {' '.join(shlex.quote(a) for a in v_args)}",
                           audit_dir)
@@ -584,14 +686,14 @@ def main() -> None:
                 rb_rc, rb_stdout, rb_stderr = run_primitive(
                     f"rollback[{i}]", rb_primitive, rb_args, primitives_dir, capture=True,
                 )
-                write_audit_event(run_id, "agent_gate", f"rollback:{rb_primitive}",
+                write_audit_event(_ESCALATION_RUN_ID, "agent_gate", f"rollback:{rb_primitive}",
                                   rb_rc == 0, rb_rc, 0,
                                   f"{rb_primitive} {' '.join(shlex.quote(a) for a in rb_args)}",
                                   audit_dir)
 
         print(json.dumps({
             "success": False,
-            "run_id": run_id,
+            "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
             "error": "verification_failed",
             "rollback_attempted": rollback_attempted,
             "audit_decision_file": str(decision_audit_file),
@@ -602,7 +704,7 @@ def main() -> None:
     print(json.dumps({
         "success": True,
         "mode": "execute",
-        "run_id": run_id,
+        "_ESCALATION_RUN_ID": _ESCALATION_RUN_ID,
         "action": {
             "primitive": decision.primitive,
             "args": decision.args,
