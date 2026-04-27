@@ -1,5 +1,6 @@
-# Local inventory and secrets
+# Local inventory, autonomy policy, and secrets
 hosts.yaml
+autonomy.yaml
 .secrets/*
 !.secrets/
 !.secrets/*.example
