@@ -15,6 +15,8 @@ while [[ $# -gt 0 ]]; do
             CONFIRM_FLAG="--confirm"; shift ;;
         --sudo)
             SUDO_RETRY=1; shift ;;
+        "")
+            shift ;;
         *)
             echo "未知参数: $1" >&2
             exit 2 ;;
