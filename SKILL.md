@@ -1,13 +1,14 @@
 ---
 name: linux-ops
-version: 1.3.0
+version: 1.4.0
 description: >
   Agent-native Linux operations skill over SSH. Use when an AI Agent needs to observe,
-  reason about, and operate remote Linux servers using composable primitives: system,
-  file, process, network, package, service, transfer, locks, and free-form commands.
-  Supports ControlMaster connection reuse, target selection, concurrent batch execution,
-  policy guardrails, output redaction, audit logs, per-run result storage, explicit sudo
-  retry, and local inventory validation.
+  reason about, and operate remote Linux servers using composable primitives. This skill
+  is an AI-native operations substrate, not a task-script collection: the skill owns safe
+  execution primitives and guardrails; the model owns observation, reasoning, diagnosis,
+  decision-making, verification, and escalation. Supports ControlMaster reuse, target
+  selection, batch execution, policy guardrails, redaction, audit logs, explicit sudo retry,
+  inventory validation, autonomy levels, and decision records for unattended operation.
 compatibility:
   tools:
     - exec
@@ -26,13 +27,15 @@ compatibility:
 
 This is an **Agent-native Linux operations primitive layer over SSH**.
 
-It is not an Ansible clone and should not be used like a rigid playbook runner. The Agent should:
+It is not an Ansible clone, not a hidden playbook runner, and not a growing pile of one-off repair scripts. The Agent should use its Linux and operations knowledge to reason from live observations, then choose bounded primitives under policy guardrails.
+
+Recommended loop:
 
 ```text
-observe -> reason -> choose primitive -> execute -> inspect result -> continue or stop
+observe -> classify -> hypothesize -> choose primitive -> execute under guardrails -> verify -> continue, stop, or escalate
 ```
 
-The skill provides safe, composable Linux operation primitives. The Agent remains responsible for diagnosis, sequencing, and deciding the next action.
+The skill provides safe, composable Linux operation primitives. The Agent remains responsible for diagnosis, sequencing, confidence assessment, verification, and deciding the next action.
 
 ---
 
@@ -46,23 +49,90 @@ The skill provides safe, composable Linux operation primitives. The Agent remain
 - `lock.sh` is a coordination primitive for write operations.
 - `validate_hosts.sh` validates local inventory shape and OPSEC hygiene.
 - `common.sh` provides config loading, JSON output, redaction, policy checks, and audit logging.
+- `autonomy.example.yaml` describes local autonomy boundaries.
+- `schemas/decision-record.schema.json` defines concise auditable decision records.
 
 Prefer primitives over free-form shell when a primitive exists, but do not force a fixed workflow. Let the Agent combine primitives based on observations.
 
 ---
 
+## Agent Reasoning Model
+
+The Agent may use general knowledge of Linux, networking, filesystems, systemd, package managers, common daemons, and failure modes. It must verify assumptions with live host observations before acting.
+
+Examples:
+
+- Know that Caddy/nginx/Apache are commonly systemd services, but verify with `service.sh status`, `sys.sh journal`, and `net.sh listen`.
+- Know that Debian-like systems often use `apt`, RHEL-like systems use `yum` or `dnf`, and Alpine uses `apk`, but verify with `pkg.sh detect`.
+- Know that disk pressure can break logs, package managers, and certificate renewal, but verify with `sys.sh disk` and bounded file/log primitives.
+- Know that 80/443 are typical web ports, but verify listen state and service ownership before making changes.
+
+The model should not treat prior knowledge as proof. Live observations win.
+
+---
+
+## Autonomy and Unattended Operation
+
+Unattended operation must be optimized through **autonomy levels, decision records, verification, and escalation**, not through fixed repair scripts.
+
+Reference docs:
+
+```text
+docs/agent-autonomy.md
+docs/agent-autonomy.zh-CN.md
+autonomy.example.yaml
+schemas/decision-record.schema.json
+```
+
+Default unattended mode should be **L1 observe-only**.
+
+| Level | Meaning | Default stance |
+|---|---|---|
+| L0 | Advisory only; no remote execution | Always safe |
+| L1 | Bounded read-only observation | Default unattended mode |
+| L2 | Low-risk reversible self-heal | Requires explicit local autonomy policy |
+| L3 | Bounded non-prod change with verification | Requires explicit local autonomy policy and strict stop conditions |
+| L4 | Privileged or production-impacting action | Requires confirmation or approval |
+| L5 | Forbidden | Never execute unattended |
+
+Before any unattended action beyond read-only observation, the Agent should produce a concise decision record. This is not a chain-of-thought dump; it is an auditable operational summary.
+
+Minimum decision record fields:
+
+```json
+{
+  "intent": "restore web service availability",
+  "autonomy_level": "L2",
+  "observations": ["caddy service is inactive", "port 443 is not listening"],
+  "hypothesis": "service stopped or failed during reload",
+  "risk": "medium",
+  "action": { "primitive": "service.sh", "command": "status caddy" },
+  "guardrails": {
+    "requires_confirmation": false,
+    "requires_lock": false,
+    "rollback_available": false
+  },
+  "verification": ["check service status", "check port 443 listen state"],
+  "stop_condition": "service active and port 443 listening, or policy blocks change",
+  "confidence": "medium"
+}
+```
+
+---
+
 ## Setup
 
-The public repository ships a safe example inventory only. Real inventory and secrets are local-only.
+The public repository ships safe examples only. Real inventory, autonomy policy, and secrets are local-only.
 
 ```bash
 cp skills/ssh/hosts.example.yaml skills/ssh/hosts.yaml
+cp skills/ssh/autonomy.example.yaml skills/ssh/autonomy.yaml
 mkdir -p skills/ssh/.secrets
 cp skills/ssh/.secrets/host.env.example skills/ssh/.secrets/<host>.env
 bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.yaml --allow-real-hosts
 ```
 
-Never commit real `hosts.yaml` or `.secrets/` content.
+Never commit real `hosts.yaml`, `autonomy.yaml`, or `.secrets/` content.
 
 ---
 
@@ -234,6 +304,9 @@ bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/file /remote/file -
 12. **Truncate large outputs**: use limits in primitives or add `head`/`tail` to raw commands.
 13. **Do not auto-kill busy processes**: file upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
 14. **Review summaries before follow-up actions**: for batch runs, inspect failed hosts before remediation.
+15. **Do not task-script the Agent**: avoid fixed app-specific repair scripts. Capture reusable behavior as primitives, autonomy policy, or Agent reasoning patterns.
+16. **Unattended changes need verification**: every state-changing unattended action must define verification and stop conditions.
+17. **Escalate ambiguity**: conflicting evidence, missing rollback, production targets, or high risk must stop autonomous execution and ask for confirmation.
 
 ---
 
