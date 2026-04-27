@@ -275,12 +275,13 @@
         "*": "high"
       },
       "unattended": {
-        "L1": false,
-        "L2": false,
-        "L3": false,
+        "L1": true,
+        "L2": true,
+        "L3": true,
         "L4": true
       },
-      "note": "L4 requires --allow-raw-exec or --confirm; gate enforces this separately."
+      "note": "L4 requires --allow-raw-exec or --confirm; gate enforces this separately.",
+      "gate_handles_block": true
     },
     "scp_transfer.sh": {
       "description": "File transfer",
@@ -317,11 +318,26 @@
           "services",
           "network",
           "quick",
+          "journal"
+        ],
+        "L2": [
+          "healthcheck",
+          "disk",
+          "memory",
+          "services",
+          "network",
+          "quick",
           "journal",
           "all"
         ],
-        "L2": true,
         "L3": true
+      },
+      "output_bounds": {
+        "healthcheck": "~8 primitives, moderate output",
+        "all": "~12+ primitives, potentially large output",
+        "quick": "~3 primitives, lightweight",
+        "services": "depends on service count",
+        "default": "bounded"
       }
     }
   }

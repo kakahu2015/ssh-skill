@@ -8,6 +8,7 @@ runs generic verification/rollback primitives. Business-agnostic.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -369,6 +370,10 @@ class SemanticGuard:
 
         rule = self.rules[primitive]
 
+        # Primitives with gate_handles_block=true skip semantic block checks
+        if rule.get("gate_handles_block"):
+            return True, ""
+
         arg1 = rule.get("arg1", "")
         if arg1 and len(args) < 2:
             return False, f"{primitive} requires at least 2 args (host, {arg1})"
@@ -445,6 +450,7 @@ def main() -> None:
     primitives_dir = Path(os.environ.get("AGENT_GATE_PRIMITIVES_DIR", str(scripts_dir)))
     audit_dir = Path(os.environ.get("AUDIT_DIR", str(skill_dir / ".audit")))
     hosts_yaml = Path(os.environ.get("HOSTS_YAML", str(skill_dir / "hosts.yaml")))
+    rules_path = Path(os.environ.get("RULES_PATH", str(scripts_dir / "primitive_rules.json")))
 
     global _ESCALATION_WEBHOOK_URL, _ESCALATION_RUN_ID, _ESCALATION_AUDIT_DIR
     _ESCALATION_AUDIT_DIR = audit_dir
@@ -507,7 +513,6 @@ def main() -> None:
                  f"Risk {decision.risk} exceeds allowed risk for {decision.autonomy_level}.")
 
     # Risk mismatch guard
-    rules_path = scripts_dir / "primitive_rules.json"
     semantic_guard = SemanticGuard(rules_path, test_mode=args.test_mode)
     computed_risk = semantic_guard.compute_risk(decision.primitive, decision.args)
     if computed_risk != "unknown" and computed_risk != decision.risk:
@@ -532,18 +537,19 @@ def main() -> None:
             die_json("prod_guard",
                      "Production targets default to L1 observe-only unless explicitly confirmed.")
 
-    validate_primitive_name(decision.primitive, primitives_dir)
-
-    if decision.primitive == "exec.sh" and not args.allow_raw_exec and not args.confirm:
-        die_json("raw_exec_blocked",
-                 "exec.sh is blocked by agent_gate unless --allow-raw-exec or --confirm.")
-
-    # Semantic guard: validate primitive args against primitive_rules.json
+    # Semantic guard must run before primitive name validation so unknown
+    # primitives get 'semantic_blocked' (fail-closed), not 'unknown_primitive'.
     sg_valid, sg_error = semantic_guard.validate(
         decision.primitive, decision.args, decision.autonomy_level,
     )
     if not sg_valid and not args.confirm and not args.test_mode:
         die_json("semantic_blocked", sg_error)
+
+    validate_primitive_name(decision.primitive, primitives_dir)
+
+    if decision.primitive == "exec.sh" and not args.allow_raw_exec and not args.confirm:
+        die_json("raw_exec_blocked",
+                 "exec.sh is blocked by agent_gate unless --allow-raw-exec or --confirm.")
 
     # Path policy guard
     path_guard = PathPolicyGuard()
@@ -570,7 +576,29 @@ def main() -> None:
     audit_day_dir.mkdir(parents=True, exist_ok=True)
     decision_audit_file = audit_day_dir / f"{_ESCALATION_RUN_ID}.decision.json"
     redacted_text = redact(decision_path.read_text())
-    decision_audit_file.write_text(redacted_text)
+
+    # Compute hashes for audit trail integrity
+    def _file_hash(p: Path) -> str:
+        try:
+            return hashlib.sha256(p.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+    audit_meta = {
+        "decision_hash": _file_hash(decision_path),
+        "policy_hash": _file_hash(policy_file) if policy_file_found else "",
+        "rules_hash": _file_hash(rules_path) if rules_path.exists() else "",
+    }
+    # Embed audit hashes in the decision audit file
+    try:
+        audit_record = json.loads(redacted_text) if redacted_text.strip() else {}
+        if isinstance(audit_record, dict):
+            audit_record["_audit_meta"] = audit_meta
+            decision_audit_file.write_text(json.dumps(audit_record, ensure_ascii=False, indent=2))
+        else:
+            # Not a dict-shaped decision — write plain redacted text plus hashes
+            decision_audit_file.write_text(redacted_text + "\n" + json.dumps(audit_meta) + "\n")
+    except json.JSONDecodeError:
+        decision_audit_file.write_text(redacted_text + "\n" + json.dumps(audit_meta) + "\n")
 
     if args.dry_run:
         output = {

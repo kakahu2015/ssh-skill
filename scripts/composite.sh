@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # OpenClaw SSH Skill - read-only composite observation primitives.
 # Maps a named composite action to a sequence of primitive calls.
-# Does NOT call agent_gate and must NOT execute write/mutate operations.
+# Agent should route through agent_gate.sh for policy enforcement.
+# This script does NOT call agent_gate and must NOT execute write/mutate operations.
 set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,11 +15,13 @@ Read-only composite observation actions:
   healthcheck   sys.sh summary + disk + memory + load + top processes
   disk          sys.sh disk + file.sh stat on /
   memory        sys.sh memory + proc.sh mem
-  services      service.sh status for specified services (default: caddy sshd docker)
+  services      service.sh status <service> [service ...]
   network       net.sh addr + route + ports 50
-  quick         sys.sh load + disk / + memory (lightweight)
+  quick         sys.sh load + disk / + memory (lightweight, ~3 primitives)
   journal       sys.sh journal 50 (recent system journal)
   all           healthcheck + services + network (may produce large output)
+
+Services action requires at least one service name.
 
 Examples:
   composite.sh hk healthcheck
@@ -27,7 +30,7 @@ Examples:
 USAGE
 }
 
-[[ $# -ge 2 ]] || { usage; exit 1; }
+[[ $# -ge 2 ]] || { usage >&2; exit 1; }
 HOST="$1"
 ACTION="$2"
 shift 2
@@ -57,8 +60,8 @@ case "$ACTION" in
         run "Memory processes" bash "$SCRIPTS_DIR/proc.sh" "$HOST" mem 15
         ;;
     services)
-        SERVICE_ARGS=("${SERVICES[@]:-caddy sshd docker}")
-        for svc in "${SERVICE_ARGS[@]}"; do
+        [[ ${#SERVICES[@]} -ge 1 ]] || { echo "[composite] services requires at least one service name" >&2; usage >&2; exit 1; }
+        for svc in "${SERVICES[@]}"; do
             run "Service: $svc" bash "$SCRIPTS_DIR/service.sh" "$HOST" status "$svc" || true
         done
         ;;
@@ -82,7 +85,7 @@ case "$ACTION" in
         ;;
     *)
         echo "Unknown composite action: $ACTION" >&2
-        usage
+        usage >&2
         exit 1
         ;;
 esac

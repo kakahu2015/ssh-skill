@@ -1,6 +1,6 @@
 ---
 name: linux-ops
-version: 1.6.0
+version: 2.0.0
 description: >
   Agent-native Linux operations skill over SSH. Use when an AI Agent needs to observe,
   reason about, and operate remote Linux servers using composable primitives. This is an
