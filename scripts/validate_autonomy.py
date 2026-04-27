@@ -65,17 +65,23 @@ def parse_scalar(raw: str) -> Any:
     return value.strip("'\"")
 
 
-def load_policy_subset(path: Path) -> dict[str, Any]:
-    root: dict[str, Any] = {}
-    stack: list[tuple[int, Any]] = [(-1, root)]
-
+def _prepared_lines(path: Path) -> list[tuple[int, int, str]]:
+    prepared: list[tuple[int, int, str]] = []
     for lineno, raw_line in enumerate(path.read_text().splitlines(), 1):
         stripped_comment = strip_comment(raw_line)
         if not stripped_comment.strip():
             continue
         indent = len(stripped_comment) - len(stripped_comment.lstrip(" "))
-        line = stripped_comment.strip()
+        prepared.append((lineno, indent, stripped_comment.strip()))
+    return prepared
 
+
+def load_policy_subset(path: Path) -> dict[str, Any]:
+    root: dict[str, Any] = {}
+    stack: list[tuple[int, Any]] = [(-1, root)]
+    lines = _prepared_lines(path)
+
+    for idx, (lineno, indent, line) in enumerate(lines):
         while stack and indent <= stack[-1][0]:
             stack.pop()
         parent = stack[-1][1]
@@ -94,8 +100,15 @@ def load_policy_subset(path: Path) -> dict[str, Any]:
         raw_value = raw_value.strip()
 
         if raw_value == "":
-            # Look ahead is intentionally omitted; infer container type by key.
-            value: Any = [] if key == "always_escalate" else {}
+            value: Any = {}
+            for _next_lineno, next_indent, next_line in lines[idx + 1:]:
+                if next_indent <= indent:
+                    break
+                if next_line.startswith("- "):
+                    value = []
+                    break
+                value = {}
+                break
         else:
             value = parse_scalar(raw_value)
 
