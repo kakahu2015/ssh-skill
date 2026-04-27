@@ -19,24 +19,15 @@ json_escape() {
     printf '%s' "$input" | awk 'BEGIN{ORS=""}{gsub(/\\/,"\\\\");gsub(/"/,"\\\"");gsub(/\t/,"\\t");gsub(/\r/,"\\r");if(NR>1)printf "\\n";printf "%s",$0}'
 }
 
-redact() {
-    sed -E \
-      -e 's/(password|passwd|secret|token|api[_-]?key|ssh_password|private[_-]?key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=[REDACTED]/gi' \
-      -e 's/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/[REDACTED_PRIVATE_KEY]/g' \
-      -e 's/-----END [A-Z0-9 ]*PRIVATE KEY-----/[REDACTED_PRIVATE_KEY]/g' \
-      -e 's#(/[A-Za-z0-9._@+=,~-]+)*/\.ssh/[A-Za-z0-9._@+=,~/-]+#[REDACTED_KEY_PATH]#g' \
-      -e 's#(/[A-Za-z0-9._@+=,~-]+)*/\.secrets/[A-Za-z0-9._@+=,~/-]+#[REDACTED_SECRETS_PATH]#g' \
-      -e 's#(^|[[:space:]"=:/])/?keys/[A-Za-z0-9._@+=,~/-]+#\1[REDACTED_KEY_PATH]#g' \
-      -e 's#(^|[[:space:]"=])(ssh://)?[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])#\1\2[REDACTED_USER]@[REDACTED_HOST]#g' \
-      -e 's/(^|[^0-9])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9]|$)/\1[REDACTED_IP]\3/g' \
-      -e 's/(^|[^0-9A-Fa-f:])([0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}([^0-9A-Fa-f:]|$)/\1[REDACTED_IPV6]\3/g' \
-      -e 's/(^|[^0-9A-Fa-f:])([0-9A-Fa-f]{1,4}:){1,7}:([0-9A-Fa-f]{1,4})?([^0-9A-Fa-f:]|$)/\1[REDACTED_IPV6]\4/g'
-}
+# Redaction layers — delegated to Python for reliable regex handling
+redact_secret()     { python3 "$SCRIPTS_DIR/redact.py" --secret 2>/dev/null || python3 -c "import sys; sys.stdout.write(__import__('sys').stdin.read())"; }
+redact_infra()      { python3 "$SCRIPTS_DIR/redact.py" --infra  2>/dev/null || python3 -c "import sys; sys.stdout.write(__import__('sys').stdin.read())"; }
+redact()            { python3 "$SCRIPTS_DIR/redact.py"          2>/dev/null || python3 -c "import sys; sys.stdout.write(__import__('sys').stdin.read())"; }
 
 redact_string() {
     local text="${1-}" item label value
-    text="$(printf '%s' "$text" | redact)"
-    for item in "SSH_HOST:REDACTED_HOST" "SSH_USER:REDACTED_USER" "KEY_PATH:REDACTED_KEY_PATH" "SECRETS_ENV:REDACTED_SECRETS_PATH"; do
+    text="$(printf '%s' "$text" | python3 "$SCRIPTS_DIR/redact.py" 2>/dev/null || printf '%s' "$text")"
+    for item in "SSH_HOST:REDACTED_HOST" "SSH_USER:REDACTED_USER" "KEY_PATH:REDACTED_KEY_PATH" "SECRETS_ENV:REDACTED_SECRETS_PATH" "REAL_HOST:REDACTED_HOST"; do
         label="${item%%:*}"; value="${!label-}"
         [[ -n "$value" ]] && text="${text//"$value"/[$(printf '%s' "${item#*:}")]}"
     done
@@ -99,6 +90,9 @@ load_host_config() {
 
 host_count_from_csv() { awk -F',' '{print NF}' <<< "$1"; }
 _host_metadata_value() { [[ -f "$HOSTS_YAML" ]] && read_yaml "$HOSTS_YAML" "$1" "$2"; }
+_host_env() { _host_metadata_value "$1" env | tr '[:upper:]' '[:lower:]'; }
+_host_role() { _host_metadata_value "$1" role | tr '[:upper:]' '[:lower:]'; }
+_host_tags() { _host_metadata_value "$1" tags | tr '[:upper:]' '[:lower:]'; }
 
 host_is_prod() {
     local env tags
@@ -118,7 +112,55 @@ any_prod_host() {
     return 1
 }
 
-policy_risk_for_command() {
+# Policy rules file path
+POLICY_YAML="${POLICY_YAML:-$SKILL_DIR/policy.yaml}"
+POLICY_LOCAL_YAML="${POLICY_LOCAL_YAML:-$SKILL_DIR/policy.local.yaml}"
+
+_policy_match_rule() {
+    local cmd="$1" rule_id rule_pattern rule_risk rule_action
+    local policy_files="$POLICY_LOCAL_YAML $POLICY_YAML"
+    local pf
+    for pf in $policy_files; do
+        [[ -f "$pf" ]] || continue
+        local category
+        for category in deny_always confirm_single_host confirm_fleet confirm_prod; do
+            local in_category=0
+            while IFS= read -r line; do
+                if echo "$line" | grep -Eq "^${category}:"; then
+                    in_category=1; continue
+                fi
+                if echo "$line" | grep -Eq '^[a-z]' && ! echo "$line" | grep -Eq '^[[:space:]]'; then
+                    [[ "$in_category" -eq 1 ]] && break
+                fi
+                [[ "$in_category" -ne 1 ]] && continue
+                if echo "$line" | grep -q 'id:'; then
+                    rule_id="$(echo "$line" | sed 's/.*id:[[:space:]]*//; s/[[:space:]]*#.*//')"
+                fi
+                if echo "$line" | grep -q 'pattern:'; then
+                    rule_pattern="$(echo "$line" | sed 's/.*pattern:[[:space:]]*//; s/[[:space:]]*#.*//; s/^"//; s/"$//')"
+                fi
+                if echo "$line" | grep -q 'action:'; then
+                    rule_action="$(echo "$line" | sed 's/.*action:[[:space:]]*//; s/[[:space:]]*#.*//')"
+                fi
+                if echo "$line" | grep -q 'risk:'; then
+                    rule_risk="$(echo "$line" | sed 's/.*risk:[[:space:]]*//; s/[[:space:]]*#.*//')"
+                fi
+                if [[ -n "$rule_id" && -n "$rule_pattern" && -n "$rule_action" ]]; then
+                    if echo "$cmd" | grep -Eiq "$rule_pattern"; then
+                        POLICY_MATCHED_RULE="$rule_id"
+                        POLICY_MATCHED_RISK="$rule_risk"
+                        POLICY_MATCHED_ACTION="$rule_action"
+                        return 0
+                    fi
+                    rule_id=""; rule_pattern=""; rule_risk=""; rule_action=""
+                fi
+            done < "$pf"
+        done
+    done
+    return 1
+}
+
+_policy_risk_inline() {
     local cmd="$1"
     if echo "$cmd" | grep -Eiq '(^|[;&|[:space:]])(cat|less|more|tail|head|grep|awk|sed)[[:space:]].*(/etc/shadow|/etc/sudoers|/\.ssh/|id_rsa|id_ed25519|\.pem|\.key)([;&|[:space:]]|$)'; then echo high; return; fi
     if echo "$cmd" | grep -Eiq '(^|[;&|[:space:]])(rm[[:space:]].*(-r|-f|-[A-Za-z]*r[A-Za-z]*f|-[A-Za-z]*f[A-Za-z]*r)[[:space:]]+(/|/\*|/etc|/usr|/var|/home|/root)([[:space:];&|]|$)|mkfs|wipefs|fdisk|parted|sgdisk|shutdown|reboot|poweroff|halt|killall|fuser[[:space:]]+-k)([;&|[:space:]]|$)'; then echo high; return; fi
@@ -129,20 +171,40 @@ policy_risk_for_command() {
     echo low
 }
 
+policy_risk_for_command() {
+    local cmd="$1"
+    if _policy_match_rule "$cmd"; then
+        echo "$POLICY_MATCHED_RISK"
+        return
+    fi
+    _policy_risk_inline "$cmd"
+}
+
 _policy_requires_confirm() {
-    local risk="$1" host_count="$2" host_csv="${3-}"
-    [[ "$risk" == high ]] && return 0
+    local risk="$1" host_count="$2" host_csv="${3-}" rule_action="${4-}"
+    [[ "$risk" == high && "$rule_action" != "confirm_single" ]] && return 0
+    [[ "$rule_action" == "confirm_single" ]] && return 0
+    [[ "$rule_action" == "confirm_fleet" && "$host_count" -gt 1 ]] && return 0
+    if [[ "$rule_action" == "confirm_prod" ]]; then
+        any_prod_host "$host_csv" && return 0
+    fi
+    [[ "$risk" == high && "$rule_action" != "confirm_single" ]] && return 0
     [[ "$risk" == medium && "$host_count" -gt 20 ]] && return 0
     [[ "$risk" == medium ]] && any_prod_host "$host_csv" && return 0
     return 1
 }
 
 policy_check_command() {
-    local cmd="$1" host_count="${2:-1}" confirm="${3:-}" host_csv="${4:-}" risk reason
+    local cmd="$1" host_count="${2:-1}" confirm="${3:-}" host_csv="${4:-}" risk rule_action reason
     risk="$(policy_risk_for_command "$cmd")"
-    if _policy_requires_confirm "$risk" "$host_count" "$host_csv"; then
+    rule_action="${POLICY_MATCHED_ACTION:-}"
+    if [[ "$rule_action" == "block" ]]; then
+        die_json "policy_blocked" "操作被 policy 规则拦截（$POLICY_MATCHED_RULE）：$(redact_string "$cmd")"
+    fi
+    if _policy_requires_confirm "$risk" "$host_count" "$host_csv" "$rule_action"; then
         if [[ "${SSH_SKILL_CONFIRMED:-}" != yes && "$confirm" != --confirm ]]; then
             reason="risk=$risk hosts=$host_count"
+            [[ -n "$rule_action" ]] && reason="$reason rule=$POLICY_MATCHED_RULE"
             [[ "$risk" == medium && "$host_count" -le 20 ]] && reason="$reason prod_target=true"
             die_json "policy_blocked" "命令需要显式确认：设置 SSH_SKILL_CONFIRMED=yes 或追加 --confirm。$reason cmd=$(redact_string "$cmd")"
         fi

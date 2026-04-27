@@ -11,11 +11,11 @@ hosts:
     auth: key
     key_path: /keys/demo-edge-01        # Placeholder; real KEY_PATH lives in .secrets/demo-edge-01.env
     default_workdir: /opt/app
-    provider: demo-cloud
-    region: us-west
-    env: prod
+    provider: demo
+    region: demo
+    env: demo
     role: edge
-    tags: [production, edge, caddy]
+    tags: [demo, edge]
 
   demo-worker-01:
     host: demo-worker-01
@@ -24,8 +24,8 @@ hosts:
     auth: key
     key_path: /keys/demo-worker-01
     default_workdir: /opt/worker
-    provider: demo-cloud
-    region: us-west
-    env: dev
+    provider: demo
+    region: demo
+    env: demo
     role: worker
-    tags: [dev, worker]
+    tags: [demo, worker]

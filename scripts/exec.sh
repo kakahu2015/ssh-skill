@@ -121,7 +121,8 @@ STDERR_CONTENT=$(cat "$STDERR_FILE")
 ERROR_FIELD=""
 SUDO_USED=false
 
-# 权限不足时不再默认自动 sudo；只有显式 --sudo 或 SSH_SKILL_ALLOW_SUDO_RETRY=yes 才重试。
+# 权限不足时不再自动 sudo。默认返回 permission_denied + suggestion。
+# 只有显式 --sudo 或 SSH_SKILL_ALLOW_SUDO_RETRY=yes 才自动重试。
 if [[ $EXIT_CODE -ne 0 ]] && echo "$STDERR_CONTENT" | grep -qi "Permission denied"; then
     ERROR_FIELD="permission_denied"
     if [[ "$SUDO_RETRY" -eq 1 || "${SSH_SKILL_ALLOW_SUDO_RETRY:-}" == "yes" ]]; then
@@ -147,6 +148,9 @@ SUCCESS=$([ $EXIT_CODE -eq 0 ] && echo true || echo false)
 
 write_audit_event "$RUN_ID" "$HOST_NAME" "exec" "$SUCCESS" "$EXIT_CODE" "$DURATION_MS" "$REMOTE_CMD"
 
+SUGGESTION=""
+[[ "$ERROR_FIELD" == "permission_denied" ]] && SUGGESTION="retry_with_sudo"
+
 cat <<JSON
 {
   "success": $SUCCESS,
@@ -157,6 +161,8 @@ cat <<JSON
   "exit_code": $EXIT_CODE,
   "duration_ms": $DURATION_MS,
   "error": "$(safe_json_string "$ERROR_FIELD")",
+  "suggestion": "$(safe_json_string "$SUGGESTION")",
+  "requires_confirm": $([ -n "$ERROR_FIELD" ] && echo true || echo false),
   "stdout": "$(json_escape "$STDOUT_CONTENT")",
   "stderr": "$(json_escape "$STDERR_CONTENT")"
 }
