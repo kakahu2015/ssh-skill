@@ -5,12 +5,10 @@ description: >
   Agent-native Linux operations skill over SSH. Use when an AI Agent needs to observe,
   reason about, and operate remote Linux servers using composable primitives. This is an
   AI-native operations substrate, not a task-script collection: the skill owns safe
-  execution primitives, guardrails, runtime gate validation, autonomy policy validation,
-  redaction, and audit; the model owns observation, reasoning, diagnosis, decision-making,
-  verification, and escalation. Supports ControlMaster reuse, target selection, batch
-  execution, policy guardrails, explicit sudo retry, inventory validation, autonomy levels,
-  decision records, strict decision validation, mock execute/verify/rollback tests, audit
-  schema, and bounded unattended operation.
+  execution primitives, Python runtime gate enforcement, fail-closed semantic guard,
+  JSON primitive rules, autonomy policy validation, path/risk guardrails, redaction,
+  audit hashes, escalation events, and bounded testable execution; the model owns
+  observation, reasoning, diagnosis, decision-making, verification, and escalation.
 compatibility:
   tools:
     - exec
@@ -21,53 +19,77 @@ compatibility:
     - awk
     - sed
     - grep
-    - python3       # required by agent_gate.sh and validators
+    - python3
     - sshpass       # optional, only for password auth
     - timeout       # optional, used by runner.sh per-host timeout when available
+    - curl          # optional, only for webhook escalation integrations
 ---
 
-# Linux Ops Skill
+# Linux Ops Skill v2.0
 
-This is an **Agent-native Linux operations primitive layer over SSH**.
+This is an **Agent-native Linux operations runtime over SSH**.
 
-It is not an Ansible clone, not a hidden playbook runner, and not a growing pile of app-specific repair scripts. The Agent should use Linux and operations knowledge to reason from live observations, then choose bounded primitives under policy guardrails.
+It is not an Ansible clone, not a hidden playbook runner, and not a pile of app-specific repair scripts. The Agent uses Linux and operations knowledge to reason from live observations; the skill provides bounded primitives, strict contracts, fail-closed runtime gates, policy validation, redaction, audit, and escalation.
 
 Recommended loop:
 
 ```text
-observe -> classify -> hypothesize -> choose primitive -> validate decision/policy -> gate -> execute -> verify -> continue, stop, or escalate
+observe -> classify -> hypothesize -> write decision record -> validate decision/policy -> semantic gate -> execute one primitive -> verify -> rollback/escalate/stop
 ```
 
-The skill provides safe, composable Linux operation primitives. The Agent remains responsible for diagnosis, sequencing, confidence assessment, verification, and deciding the next action.
+The model is responsible for diagnosis, sequencing, confidence assessment, and deciding the next action. The runtime is responsible for refusing unsafe or malformed action requests.
 
 ---
 
-## Core Model
+## v2.0 Runtime Model
 
-- `exec.sh` is the low-level SSH syscall.
-- `agent_gate.sh` is the generic runtime gate for AI Agent decision records.
-- `validate_decision.py` is the strict, dependency-free decision record validator.
-- `validate_autonomy.py` is the dependency-free autonomy policy validator.
-- `runner.sh` is the concurrent fleet executor.
-- `select_hosts.sh` is the targeting layer.
-- `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh` are Linux operation primitives.
-- `scp_transfer.sh` is the file transfer primitive.
-- `lock.sh` is a coordination primitive for write operations.
-- `validate_hosts.sh` validates local inventory shape and OPSEC hygiene.
-- `common.sh` provides config loading, JSON output, redaction, policy checks, and audit logging.
-- `autonomy.example.yaml` describes local autonomy boundaries.
-- `schemas/decision-record.schema.json` defines concise auditable decision records.
-- `schemas/audit-event.schema.json` defines the generic audit event contract.
-- `examples/decision-record.observe.json` provides a generic dry-run example.
-- `tests/agent_gate_tests.sh` verifies generic gate allow/block and execute/verify/rollback behavior without SSH.
+Agent-owned unattended actions should flow through this chain:
 
-Prefer semantic primitives over raw shell when a primitive exists. Do not force a fixed workflow. Let the Agent combine primitives based on observations.
+```text
+decision-record.json
+  -> validate_decision.py
+  -> validate_autonomy.py
+  -> agent_gate.sh
+  -> agent_gate.py
+  -> primitive_rules.json
+  -> autonomy/risk/env/host-count checks
+  -> semantic guard
+  -> path guard
+  -> raw exec guard
+  -> execute exactly one primitive
+  -> verification_actions
+  -> rollback_actions when requested
+  -> redacted audit with decision/policy/rules hashes
+  -> escalation event on gate block
+```
+
+`agent_gate.sh` is a thin compatibility wrapper. The runtime security boundary is `agent_gate.py`, which executes primitives with argv-style subprocess calls, not shell string evaluation.
+
+---
+
+## Core Files
+
+- `scripts/agent_gate.py` — Python runtime gate and execution boundary.
+- `scripts/agent_gate.sh` — thin wrapper around `agent_gate.py`.
+- `scripts/primitive_rules.json` — fail-closed semantic rules for primitives, commands, risk, and unattended levels.
+- `scripts/validate_decision.py` — strict dependency-free decision record validator.
+- `scripts/validate_autonomy.py` — dependency-free autonomy policy validator.
+- `scripts/composite.sh` — read-only composite observation primitive; Agent use should route through the gate.
+- `scripts/sys.sh`, `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh`, `lock.sh`, `scp_transfer.sh` — generic Linux primitives.
+- `schemas/decision-record.schema.json` — decision contract.
+- `schemas/audit-event.schema.json` — audit event contract.
+- `schemas/gate-result.schema.json` — gate output contract.
+- `schemas/run-summary.schema.json` — run summary contract.
+- `schemas/escalation-event.schema.json` — escalation event contract.
+- `tests/agent_gate_tests.sh` — no-SSH runtime gate regression matrix.
+
+Prefer semantic primitives over raw shell. Do not add business-specific repair scripts.
 
 ---
 
 ## Non-Task-Script Rule
 
-Do **not** add app-specific repair scripts or hard-coded workflows such as:
+Do **not** add app-specific repair or deployment scripts such as:
 
 ```text
 fix_<service>.sh
@@ -76,53 +98,23 @@ repair_everything.sh
 cleanup_all_servers.sh
 ```
 
-If behavior is reusable, express it as one of these instead:
+Reusable behavior should be expressed as one of these:
 
 - a generic primitive,
+- a JSON primitive rule,
 - an autonomy policy rule,
 - a decision-record contract,
 - a verification/rollback contract,
 - a runtime gate check,
 - a validator,
+- a schema,
 - or an Agent reasoning pattern in docs.
 
-The runtime code must remain business-agnostic.
+The runtime must stay business-agnostic.
 
 ---
 
-## Agent Reasoning Model
-
-The Agent may use general knowledge of Linux, networking, filesystems, service managers, package managers, daemons, and failure modes. It must verify assumptions with live host observations before acting.
-
-Generic examples:
-
-- Know that many services are managed by a service manager, but verify with `service.sh status <service>`, bounded logs, process checks, and network checks.
-- Know that distributions use different package managers, but verify with `pkg.sh detect` before package operations.
-- Know that disk pressure can affect many subsystems, but verify with `sys.sh disk` and bounded file/log primitives.
-- Know that a listening port may indicate service availability, but verify listen state and ownership before changing services.
-
-The model should not treat prior knowledge as proof. Live observations win.
-
----
-
-## Autonomy and Unattended Operation
-
-Unattended operation must be optimized through **autonomy levels, decision records, runtime validation, runtime gating, verification, rollback contracts, and escalation**, not through fixed repair scripts.
-
-Reference files:
-
-```text
-docs/agent-autonomy.md
-docs/agent-autonomy.zh-CN.md
-autonomy.example.yaml
-schemas/decision-record.schema.json
-schemas/audit-event.schema.json
-examples/decision-record.observe.json
-scripts/validate_decision.py
-scripts/validate_autonomy.py
-scripts/agent_gate.sh
-tests/agent_gate_tests.sh
-```
+## Autonomy Levels
 
 Default unattended mode should be **L1 observe-only**.
 
@@ -130,65 +122,53 @@ Default unattended mode should be **L1 observe-only**.
 |---|---|---|
 | L0 | Advisory only; no remote execution | Always safe |
 | L1 | Bounded read-only observation | Default unattended mode |
-| L2 | Low-risk reversible self-heal | Requires explicit local autonomy policy |
-| L3 | Bounded non-prod change with verification | Requires explicit local autonomy policy and strict stop conditions |
-| L4 | Privileged or production-impacting action | Requires confirmation or approval |
+| L2 | Low-risk reversible self-heal | Requires explicit local policy |
+| L3 | Bounded non-prod change with verification | Requires policy and strict stop conditions |
+| L4 | Privileged or production-impacting action | Requires explicit approval |
 | L5 | Forbidden | Never execute unattended |
 
-Before any unattended action beyond read-only observation, the Agent should produce a concise decision record. This is not a chain-of-thought dump; it is an auditable operational summary.
-
-Validate inputs:
-
-```bash
-python3 skills/ssh/scripts/validate_decision.py skills/ssh/examples/decision-record.observe.json --quiet
-python3 skills/ssh/scripts/validate_autonomy.py skills/ssh/autonomy.example.yaml --quiet
-```
-
-Dry-run the runtime gate:
-
-```bash
-bash skills/ssh/scripts/agent_gate.sh \
-  --decision skills/ssh/examples/decision-record.observe.json \
-  --policy skills/ssh/autonomy.example.yaml \
-  --dry-run
-```
-
-Execute only after the gate allows the action:
-
-```bash
-bash skills/ssh/scripts/agent_gate.sh --decision <decision.json> --policy <autonomy.yaml> --execute
-```
-
-The gate is generic. It validates and dispatches primitives; it does not know business services, deployment steps, or repair workflows.
+The Agent may propose an autonomy level in a decision record, but `agent_gate.py` enforces local policy, environment limits, primitive rules, risk rules, and guardrails. A model cannot grant itself extra authority by writing a higher level into JSON.
 
 ---
 
 ## Runtime Gate Behavior
 
-`agent_gate.sh` performs these checks before execution:
+`agent_gate.py` enforces:
 
-1. Calls `validate_decision.py` to enforce the generic decision contract and OPSEC checks.
-2. Calls `validate_autonomy.py` when a policy file exists.
-3. Reads local autonomy policy when available.
-4. Checks autonomy level, risk, environment, host count, and primitive allowance.
-5. Blocks raw `exec.sh` unless explicitly approved.
-6. Executes exactly one primitive action when `--execute` is used.
-7. Runs generic `verification_actions` when supplied.
-8. Optionally runs generic `rollback_actions` after failed verification.
-9. Writes a redacted decision audit file.
+1. valid decision record shape and OPSEC constraints,
+2. valid autonomy policy shape,
+3. fail-closed JSON primitive rules,
+4. unknown primitive block unless `--test-mode` is used,
+5. unknown primitive command block,
+6. declared risk not lower than computed primitive/action risk,
+7. autonomy level and environment max-level checks,
+8. production L1 default unless explicitly confirmed,
+9. host-count limit checks,
+10. raw `exec.sh` block unless explicitly approved,
+11. sensitive path block,
+12. verification requirements for L2+ or non-low-risk execution,
+13. single primitive execution per decision,
+14. optional rollback after failed verification,
+15. escalation event generation on gate blocks,
+16. redacted audit containing decision, policy, and rules hashes.
 
-The test matrix covers:
+`--test-mode` is for local mock primitive tests only. It must not be used for production operation.
 
-- L1 observe allow,
-- raw `exec.sh` block,
-- production L3 block without confirmation,
-- host count block,
-- OPSEC leakage block,
-- unknown field block,
-- invalid autonomy policy block,
-- execute success plus verification success,
-- verification failure plus rollback,
-- primary action failure stop.
+---
+
+## Composite Observations
+
+`composite.sh` is a read-only primitive for common observation bundles. It does not mutate remote state and does not embed business workflows.
+
+Supported actions:
+
+```text
+healthcheck, disk, memory, services, network, quick, journal, all
+```
+
+`services` requires explicit service names. No default business or platform service names are embedded.
+
+`primitive_rules.json` allows lightweight composite observations at L1 and moves the larger `all` action to L2 because it may produce more output.
 
 ---
 
@@ -208,26 +188,47 @@ Never commit real `hosts.yaml`, `autonomy.yaml`, or `.secrets/` content.
 
 ---
 
-## Security Rules (MUST follow)
+## Agent Workflow
 
-1. **Never output credentials or infrastructure identifiers**: IPs, usernames, passwords, key paths, `.secrets` paths, private hostnames, and key contents must not appear in conversation.
-2. **Never read private key contents**: reference keys by path only. Never `cat` private keys.
-3. **Never modify `.secrets/` from Agent commands** unless the user explicitly requests it.
-4. **Observe before changing**: for unclear problems, use observation primitives before applying changes.
-5. **Use primitives first**: prefer semantic primitives over raw `exec.sh` when available.
-6. **Use `agent_gate.sh` for Agent-owned unattended actions** when a decision record is available.
-7. **Validate Agent-generated decisions and autonomy policy before execution.**
-8. **Use runner for fleets** with `--parallel`, `--timeout`, and preferably `--fail-fast`.
-9. **Use locks for write operations** when doing multi-step writes on a host.
-10. **Confirm destructive commands**: high-risk operations require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
-11. **Confirm prod-impacting medium-risk commands**: if `env` is `prod/production` or tags contain `prod/production`, restarts and package changes require confirmation.
-12. **No implicit sudo**: do not rely on automatic sudo retry. Use `--sudo` only when the user intent requires it.
-13. **No sudo passwords**: do not embed sudo passwords in commands.
-14. **Truncate large outputs**: use primitive limits or bounded shell commands.
-15. **Do not auto-kill busy processes**: file upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
-16. **Do not task-script the Agent**: avoid fixed app-specific repair scripts.
-17. **Unattended changes need verification**: every state-changing unattended action must define verification and stop conditions.
-18. **Escalate ambiguity**: conflicting evidence, missing rollback, production targets, or high risk must stop autonomous execution and ask for confirmation.
+Validate inputs:
+
+```bash
+python3 skills/ssh/scripts/validate_decision.py skills/ssh/examples/decision-record.observe.json --quiet
+python3 skills/ssh/scripts/validate_autonomy.py skills/ssh/autonomy.example.yaml --quiet
+python3 -m py_compile skills/ssh/scripts/agent_gate.py
+```
+
+Dry-run the runtime gate:
+
+```bash
+bash skills/ssh/scripts/agent_gate.sh \
+  --decision skills/ssh/examples/decision-record.observe.json \
+  --policy skills/ssh/autonomy.example.yaml \
+  --dry-run
+```
+
+Execute only after the gate allows the action:
+
+```bash
+bash skills/ssh/scripts/agent_gate.sh --decision <decision.json> --policy <autonomy.yaml> --execute
+```
+
+Use `--allow-raw-exec` only when a semantic primitive cannot express the requested operation and the user explicitly approves raw shell execution.
+
+---
+
+## Security Rules
+
+1. Never output credentials or infrastructure identifiers: IPs, usernames, passwords, key paths, `.secrets` paths, private hostnames, or key contents.
+2. Never read private key contents.
+3. Never modify `.secrets/` from Agent commands unless explicitly requested.
+4. Observe before changing.
+5. Use primitives first; raw `exec.sh` is not an unattended default.
+6. Route Agent-owned unattended actions through `agent_gate.sh` / `agent_gate.py`.
+7. Treat missing, corrupt, or incomplete runtime rules as a block condition.
+8. Do not task-script the Agent with app-specific repair flows.
+9. Every state-changing unattended action needs verification and stop conditions.
+10. Escalate ambiguity, conflicting evidence, missing rollback, production targets, or high risk.
 
 ---
 
@@ -235,7 +236,7 @@ Never commit real `hosts.yaml`, `autonomy.yaml`, or `.secrets/` content.
 
 ```bash
 bash -n skills/ssh/scripts/*.sh skills/ssh/tests/*.sh
-python3 -m py_compile skills/ssh/scripts/validate_decision.py skills/ssh/scripts/validate_autonomy.py
+python3 -m py_compile skills/ssh/scripts/validate_decision.py skills/ssh/scripts/validate_autonomy.py skills/ssh/scripts/agent_gate.py skills/ssh/scripts/redact.py
 bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.example.yaml
 python3 skills/ssh/scripts/validate_autonomy.py skills/ssh/autonomy.example.yaml --quiet
 python3 skills/ssh/scripts/validate_decision.py skills/ssh/examples/decision-record.observe.json --quiet
@@ -243,4 +244,4 @@ bash skills/ssh/scripts/agent_gate.sh --decision skills/ssh/examples/decision-re
 bash skills/ssh/tests/agent_gate_tests.sh
 ```
 
-GitHub Actions runs syntax checks, example inventory validation, autonomy policy validation, decision validation, generic agent gate dry-run, the generic gate test matrix, and advisory ShellCheck.
+The gate test matrix covers allow/block paths, raw exec block, production guard, host-count guard, OPSEC validation, unknown field block, invalid policy block, mock execute/verify/rollback, unknown primitive block, unknown command block, risk mismatch, path block, corrupt rules fail-closed behavior, composite L1 restriction, escalation file generation, and audit hash metadata.
