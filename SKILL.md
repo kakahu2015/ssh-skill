@@ -8,7 +8,8 @@ description: >
   execution primitives and guardrails; the model owns observation, reasoning, diagnosis,
   decision-making, verification, and escalation. Supports ControlMaster reuse, target
   selection, batch execution, policy guardrails, redaction, audit logs, explicit sudo retry,
-  inventory validation, autonomy levels, and decision records for unattended operation.
+  inventory validation, autonomy levels, agent_gate runtime enforcement, and decision
+  records for bounded unattended operation.
 compatibility:
   tools:
     - exec
@@ -19,6 +20,7 @@ compatibility:
     - awk
     - sed
     - grep
+    - python3       # required by agent_gate.sh for JSON decision parsing
     - sshpass       # optional, only for password auth
     - timeout       # optional, used by runner.sh per-host timeout when available
 ---
@@ -27,12 +29,12 @@ compatibility:
 
 This is an **Agent-native Linux operations primitive layer over SSH**.
 
-It is not an Ansible clone, not a hidden playbook runner, and not a growing pile of one-off repair scripts. The Agent should use its Linux and operations knowledge to reason from live observations, then choose bounded primitives under policy guardrails.
+It is not an Ansible clone, not a hidden playbook runner, and not a growing pile of app-specific repair scripts. The Agent should use its Linux and operations knowledge to reason from live observations, then choose bounded primitives under policy guardrails.
 
 Recommended loop:
 
 ```text
-observe -> classify -> hypothesize -> choose primitive -> execute under guardrails -> verify -> continue, stop, or escalate
+observe -> classify -> hypothesize -> choose primitive -> gate -> execute -> verify -> continue, stop, or escalate
 ```
 
 The skill provides safe, composable Linux operation primitives. The Agent remains responsible for diagnosis, sequencing, confidence assessment, verification, and deciding the next action.
@@ -42,6 +44,7 @@ The skill provides safe, composable Linux operation primitives. The Agent remain
 ## Core Model
 
 - `exec.sh` is the low-level SSH syscall.
+- `agent_gate.sh` is the generic runtime gate for AI Agent decision records.
 - `runner.sh` is the concurrent fleet executor.
 - `select_hosts.sh` is the targeting layer.
 - `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh` are Linux operation primitives.
@@ -51,21 +54,45 @@ The skill provides safe, composable Linux operation primitives. The Agent remain
 - `common.sh` provides config loading, JSON output, redaction, policy checks, and audit logging.
 - `autonomy.example.yaml` describes local autonomy boundaries.
 - `schemas/decision-record.schema.json` defines concise auditable decision records.
+- `examples/decision-record.observe.json` provides a generic dry-run example.
 
-Prefer primitives over free-form shell when a primitive exists, but do not force a fixed workflow. Let the Agent combine primitives based on observations.
+Prefer semantic primitives over raw shell when a primitive exists. Do not force a fixed workflow. Let the Agent combine primitives based on observations.
+
+---
+
+## Non-Task-Script Rule
+
+Do **not** add app-specific repair scripts or hard-coded workflows such as:
+
+```text
+fix_<service>.sh
+deploy_<app>.sh
+repair_everything.sh
+cleanup_all_servers.sh
+```
+
+If behavior is reusable, express it as:
+
+- a generic primitive,
+- an autonomy policy rule,
+- a decision-record contract,
+- a verification/rollback contract,
+- or an Agent reasoning pattern in docs.
+
+The runtime code must remain business-agnostic.
 
 ---
 
 ## Agent Reasoning Model
 
-The Agent may use general knowledge of Linux, networking, filesystems, systemd, package managers, common daemons, and failure modes. It must verify assumptions with live host observations before acting.
+The Agent may use general knowledge of Linux, networking, filesystems, system managers, package managers, daemons, and failure modes. It must verify assumptions with live host observations before acting.
 
-Examples:
+Generic examples:
 
-- Know that Caddy/nginx/Apache are commonly systemd services, but verify with `service.sh status`, `sys.sh journal`, and `net.sh listen`.
-- Know that Debian-like systems often use `apt`, RHEL-like systems use `yum` or `dnf`, and Alpine uses `apk`, but verify with `pkg.sh detect`.
-- Know that disk pressure can break logs, package managers, and certificate renewal, but verify with `sys.sh disk` and bounded file/log primitives.
-- Know that 80/443 are typical web ports, but verify listen state and service ownership before making changes.
+- Know that many services are managed by a service manager, but verify with `service.sh status <service>`, bounded logs, and network/process primitives.
+- Know that distributions use different package managers, but verify with `pkg.sh detect` before package operations.
+- Know that disk pressure can affect many subsystems, but verify with `sys.sh disk` and bounded file/log primitives.
+- Know that a listening port may indicate service availability, but verify listen state and ownership before changing services.
 
 The model should not treat prior knowledge as proof. Live observations win.
 
@@ -73,15 +100,16 @@ The model should not treat prior knowledge as proof. Live observations win.
 
 ## Autonomy and Unattended Operation
 
-Unattended operation must be optimized through **autonomy levels, decision records, verification, and escalation**, not through fixed repair scripts.
+Unattended operation must be optimized through **autonomy levels, decision records, runtime gating, verification, and escalation**, not through fixed repair scripts.
 
-Reference docs:
+Reference files:
 
 ```text
 docs/agent-autonomy.md
 docs/agent-autonomy.zh-CN.md
 autonomy.example.yaml
 schemas/decision-record.schema.json
+examples/decision-record.observe.json
 ```
 
 Default unattended mode should be **L1 observe-only**.
@@ -97,24 +125,38 @@ Default unattended mode should be **L1 observe-only**.
 
 Before any unattended action beyond read-only observation, the Agent should produce a concise decision record. This is not a chain-of-thought dump; it is an auditable operational summary.
 
-Minimum decision record fields:
+Generic dry-run gate:
+
+```bash
+bash skills/ssh/scripts/agent_gate.sh \
+  --decision skills/ssh/examples/decision-record.observe.json \
+  --policy skills/ssh/autonomy.example.yaml \
+  --dry-run
+```
+
+Generic decision record shape:
 
 ```json
 {
-  "intent": "restore web service availability",
-  "autonomy_level": "L2",
-  "observations": ["caddy service is inactive", "port 443 is not listening"],
-  "hypothesis": "service stopped or failed during reload",
-  "risk": "medium",
-  "action": { "primitive": "service.sh", "command": "status caddy" },
+  "intent": "collect bounded host or service evidence",
+  "autonomy_level": "L1",
+  "target_scope": { "hosts": ["<host>"], "environment": "<env>" },
+  "observations": ["target selected from metadata", "requested operation is read-only"],
+  "hypothesis": "bounded observation is needed before diagnosis or change",
+  "risk": "low",
+  "action": { "primitive": "service.sh", "args": ["<host>", "status", "<service>"] },
   "guardrails": {
     "requires_confirmation": false,
     "requires_lock": false,
-    "rollback_available": false
+    "rollback_available": false,
+    "max_hosts": 1
   },
-  "verification": ["check service status", "check port 443 listen state"],
-  "stop_condition": "service active and port 443 listening, or policy blocks change",
-  "confidence": "medium"
+  "verification": ["gate validates autonomy level, risk, primitive, and policy boundary"],
+  "verification_actions": [],
+  "rollback": [],
+  "rollback_actions": [],
+  "stop_condition": "gate succeeds or reports an autonomy/policy/schema error",
+  "confidence": "high"
 }
 ```
 
@@ -138,21 +180,16 @@ Never commit real `hosts.yaml`, `autonomy.yaml`, or `.secrets/` content.
 
 ## Preferred Agent Workflow
 
-### 1. List hosts
+### 1. List or select hosts
 
 ```bash
 bash skills/ssh/scripts/list_hosts.sh
 bash skills/ssh/scripts/list_hosts.sh --check
+bash skills/ssh/scripts/select_hosts.sh --target "tag=<tag>,role=<role>" --csv
+bash skills/ssh/scripts/select_hosts.sh --env <env> --region <region> --role <role> --csv
 ```
 
-### 2. Select target hosts
-
-```bash
-bash skills/ssh/scripts/select_hosts.sh --target "tag=production,role=edge" --csv
-bash skills/ssh/scripts/select_hosts.sh --env prod --region hk --role caddy --csv
-```
-
-### 3. Observe first
+### 2. Observe first
 
 Single host:
 
@@ -161,45 +198,32 @@ bash skills/ssh/scripts/sys.sh <host> summary
 bash skills/ssh/scripts/sys.sh <host> disk
 bash skills/ssh/scripts/proc.sh <host> top 30
 bash skills/ssh/scripts/net.sh <host> ports 100
-bash skills/ssh/scripts/service.sh <host> status caddy
+bash skills/ssh/scripts/service.sh <host> status <service>
 ```
 
-Fleet:
+Fleet read-only observation:
 
 ```bash
 bash skills/ssh/scripts/runner.sh \
-  --target "tag=production" \
+  --target "tag=<tag>" \
   --cmd "uptime" \
   --parallel 20 \
   --timeout 30 \
   --fail-fast 20%
 ```
 
-### 4. Reason from JSON results
+### 3. Gate autonomous actions
 
-Read the compact summary first. For fleet runs, inspect failed hosts from:
-
-```text
-.runs/<run_id>/results/<host>.json
-```
-
-Audit logs are written to:
-
-```text
-.audit/<YYYY-MM-DD>/<run_id>.jsonl
-```
-
-### 5. Use write locks for coordinated changes
-
-For write operations that may overlap with other tasks:
+For Agent-driven execution, wrap actions in `agent_gate.sh` whenever a decision record is available:
 
 ```bash
-bash skills/ssh/scripts/lock.sh <host> acquire --timeout 60 --run-id <run_id>
-# perform operation
-bash skills/ssh/scripts/lock.sh <host> release --run-id <run_id>
+bash skills/ssh/scripts/agent_gate.sh --decision <decision.json> --policy <autonomy.yaml> --dry-run
+bash skills/ssh/scripts/agent_gate.sh --decision <decision.json> --policy <autonomy.yaml> --execute
 ```
 
-Do not make lock usage a rigid workflow for read-only operations.
+### 4. Verify and stop or escalate
+
+Every state-changing action must define verification. If verification fails, evidence conflicts, rollback is missing, or production risk appears, stop and escalate.
 
 ---
 
@@ -280,12 +304,6 @@ bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/path /remote/path
 bash skills/ssh/scripts/scp_transfer.sh <host> download /remote/path /local/path
 ```
 
-If a target file is busy, default behavior is to return `target_busy`. Only release busy processes with explicit authorization:
-
-```bash
-bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/file /remote/file --force-release
-```
-
 ---
 
 ## Security Rules (MUST follow)
@@ -293,18 +311,18 @@ bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/file /remote/file -
 1. **Never output credentials or infrastructure identifiers**: IPs, usernames, passwords, key paths, `.secrets` paths, private hostnames, and key contents must not appear in conversation.
 2. **Never read private key contents**: reference keys by path only. Never `cat` private keys.
 3. **Never modify `.secrets/` from Agent commands** unless the user explicitly requests it.
-4. **Observe before changing**: for unclear problems, use `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, and `service.sh status/logs` before applying changes.
-5. **Use primitives first**: prefer `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh` over raw `exec.sh` when available.
-6. **Use runner for fleets**: for more than a few hosts, use `runner.sh` with `--parallel`, `--timeout`, and preferably `--fail-fast`.
-7. **Use locks for write operations**: when doing multi-step writes on a host, use `lock.sh acquire/release`.
-8. **Confirm destructive commands**: high-risk operations require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
-9. **Confirm prod-impacting medium-risk commands**: if `env` is `prod/production` or tags contain `prod/production`, restarts and package changes require confirmation.
-10. **No implicit sudo**: do not rely on automatic sudo retry. Use `--sudo` only when the user intent requires it.
-11. **No sudo passwords**: do not embed sudo passwords in commands. Suggest NOPASSWD sudoers or manual operation.
-12. **Truncate large outputs**: use limits in primitives or add `head`/`tail` to raw commands.
-13. **Do not auto-kill busy processes**: file upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
-14. **Review summaries before follow-up actions**: for batch runs, inspect failed hosts before remediation.
-15. **Do not task-script the Agent**: avoid fixed app-specific repair scripts. Capture reusable behavior as primitives, autonomy policy, or Agent reasoning patterns.
+4. **Observe before changing**: for unclear problems, use observation primitives before applying changes.
+5. **Use primitives first**: prefer semantic primitives over raw `exec.sh` when available.
+6. **Use `agent_gate.sh` for Agent-owned unattended actions** when a decision record is available.
+7. **Use runner for fleets** with `--parallel`, `--timeout`, and preferably `--fail-fast`.
+8. **Use locks for write operations** when doing multi-step writes on a host.
+9. **Confirm destructive commands**: high-risk operations require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
+10. **Confirm prod-impacting medium-risk commands**: if `env` is `prod/production` or tags contain `prod/production`, restarts and package changes require confirmation.
+11. **No implicit sudo**: do not rely on automatic sudo retry. Use `--sudo` only when the user intent requires it.
+12. **No sudo passwords**: do not embed sudo passwords in commands.
+13. **Truncate large outputs**: use primitive limits or bounded shell commands.
+14. **Do not auto-kill busy processes**: file upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
+15. **Do not task-script the Agent**: avoid fixed app-specific repair scripts.
 16. **Unattended changes need verification**: every state-changing unattended action must define verification and stop conditions.
 17. **Escalate ambiguity**: conflicting evidence, missing rollback, production targets, or high risk must stop autonomous execution and ask for confirmation.
 
@@ -315,33 +333,30 @@ bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/file /remote/file -
 High-risk examples:
 
 - Reading private keys, `/etc/shadow`, or `/etc/sudoers`
-- `rm -rf /`, `rm -rf /etc`, `rm -rf /usr`, `rm -rf /home`, `rm -rf /root`
-- `mkfs`, `wipefs`, `fdisk`, `parted`, `sgdisk`
-- `dd ... of=/dev/...`
-- `shutdown`, `reboot`, `poweroff`, `halt`
-- `iptables -F`, `ip6tables -F`, `nft flush`, `ufw disable`
-- `killall`, `fuser -k`
-- `systemctl stop`, `systemctl disable`, `systemctl mask`
-- `docker rm -f`, `docker system prune`
-- `kubectl delete`
-- `bash -c` / `sh -c` mixed with `base64 -d`, `curl`, or `wget`
+- broad destructive deletion of system paths
+- disk formatting, partitioning, or raw device writes
+- shutdown/reboot/poweroff/halt
+- firewall flush or disable operations
+- process mass-kill operations
+- service stop/disable/mask
+- destructive container or orchestrator operations
+- shell execution patterns that combine downloaders or base64 decoding
 
 Medium-risk examples:
 
-- `systemctl restart/reload`
-- `service <name> restart/reload`
-- `chmod 777`, `chown -R`
+- service restart/reload
+- broad chmod/chown
 - package install/remove/upgrade commands
-- `docker restart/stop`
-- `kubectl apply/rollout/scale`
+- container restart/stop
+- orchestrator apply/rollout/scale
 
 Medium risk requires confirmation when it affects more than 20 hosts or any production-tagged target.
 
 Confirm explicitly:
 
 ```bash
-bash skills/ssh/scripts/exec.sh <host> "sudo systemctl restart caddy" --confirm
-SSH_SKILL_CONFIRMED=yes bash skills/ssh/scripts/exec.sh <host> "sudo systemctl restart caddy"
+bash skills/ssh/scripts/exec.sh <host> "sudo systemctl restart <service>" --confirm
+SSH_SKILL_CONFIRMED=yes bash skills/ssh/scripts/exec.sh <host> "sudo systemctl restart <service>"
 ```
 
 ---
@@ -362,14 +377,14 @@ Default JSON result includes:
 Explicit sudo retry:
 
 ```bash
-bash skills/ssh/scripts/exec.sh <host> "cat /var/log/app.log | tail -50" --sudo
-bash skills/ssh/scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50" --sudo
+bash skills/ssh/scripts/exec.sh <host> "tail -50 <log-path>" --sudo
+bash skills/ssh/scripts/runner.sh --target "tag=<tag>" --cmd "tail -50 <log-path>" --sudo
 ```
 
 Environment opt-in:
 
 ```bash
-SSH_SKILL_ALLOW_SUDO_RETRY=yes bash skills/ssh/scripts/exec.sh <host> "cat /var/log/app.log | tail -50"
+SSH_SKILL_ALLOW_SUDO_RETRY=yes bash skills/ssh/scripts/exec.sh <host> "tail -50 <log-path>"
 ```
 
 The sudo retry path still runs `policy_check_command` before execution.
@@ -380,21 +395,21 @@ The sudo retry path still runs `policy_check_command` before execution.
 
 ```yaml
 hosts:
-  prod-edge-01:
-    host: prod-edge-01                  # Placeholder, real IP/domain in .secrets/prod-edge-01.env
+  demo-host-01:
+    host: demo-host-01                  # Placeholder, real IP/domain in .secrets/demo-host-01.env
     port: 22
     user: ubuntu
     auth: key
-    key_path: /keys/prod-edge-01        # Placeholder, real path in .secrets/prod-edge-01.env
-    default_workdir: /opt/myapp
-    provider: oci
-    region: us-west
+    key_path: /keys/demo-host-01        # Placeholder, real path in .secrets/demo-host-01.env
+    default_workdir: /opt/workdir
+    provider: demo-provider
+    region: demo-region
     env: prod
-    role: edge
-    tags: [production, us-west, caddy, edge]
+    role: generic-role
+    tags: [production, generic]
 ```
 
-Corresponding `.secrets/prod-edge-01.env`:
+Corresponding `.secrets/demo-host-01.env`:
 
 ```bash
 HOST=203.0.113.10
@@ -428,45 +443,12 @@ Redaction covers:
 
 ---
 
-## Output Truncation
-
-Commands that may output a lot of text must be truncated by the caller:
-
-```bash
-dmesg | tail -50
-journalctl --since today | head -100
-cat /var/log/syslog | tail -200
-find / -name "*.log" | head -30
-ps aux | head -50
-```
-
-Use primitive limits where possible.
-
----
-
-## Error Handling
-
-| Error | Action |
-|-------|--------|
-| `hosts.yaml` not found | Copy `hosts.example.yaml` to `hosts.yaml`, then add real values under `.secrets/` |
-| Host not in yaml | List existing hosts and ask user to add the host |
-| `sshpass` not installed | Suggest installing `sshpass` or switching to key auth |
-| Connection timeout | Check host/port/firewall and retry later |
-| Auth failed | Check `.secrets/` config; do not output credentials |
-| ControlMaster socket expired | Auto re-run `connect.sh`, then retry |
-| `policy_blocked` | Ask for explicit confirmation before continuing |
-| `permission_denied` | Ask whether to retry with `--sudo`; do not auto-sudo |
-| `target_busy` | Ask whether to retry with `--force-release` |
-| `lock_owned_by_other` | Wait, inspect lock status, or ask before force unlock |
-| Command `exit_code != 0` | Return JSON result and summarize failed hosts |
-
----
-
 ## Local Quality Checks
 
 ```bash
 bash -n skills/ssh/scripts/*.sh
 bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.example.yaml
+bash skills/ssh/scripts/agent_gate.sh --decision skills/ssh/examples/decision-record.observe.json --policy skills/ssh/autonomy.example.yaml --dry-run
 ```
 
-GitHub Actions runs syntax checks, example inventory validation, and advisory ShellCheck.
+GitHub Actions runs syntax checks, example inventory validation, generic agent gate dry-run, and advisory ShellCheck.
