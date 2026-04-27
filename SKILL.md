@@ -1,16 +1,16 @@
 ---
 name: linux-ops
-version: 1.5.0
+version: 1.6.0
 description: >
   Agent-native Linux operations skill over SSH. Use when an AI Agent needs to observe,
   reason about, and operate remote Linux servers using composable primitives. This is an
   AI-native operations substrate, not a task-script collection: the skill owns safe
-  execution primitives, guardrails, runtime gate validation, redaction, and audit; the
-  model owns observation, reasoning, diagnosis, decision-making, verification, and
-  escalation. Supports ControlMaster reuse, target selection, batch execution, policy
-  guardrails, explicit sudo retry, inventory validation, autonomy levels, decision
-  records, strict decision validation, and generic gate tests for bounded unattended
-  operation.
+  execution primitives, guardrails, runtime gate validation, autonomy policy validation,
+  redaction, and audit; the model owns observation, reasoning, diagnosis, decision-making,
+  verification, and escalation. Supports ControlMaster reuse, target selection, batch
+  execution, policy guardrails, explicit sudo retry, inventory validation, autonomy levels,
+  decision records, strict decision validation, mock execute/verify/rollback tests, audit
+  schema, and bounded unattended operation.
 compatibility:
   tools:
     - exec
@@ -21,7 +21,7 @@ compatibility:
     - awk
     - sed
     - grep
-    - python3       # required by agent_gate.sh and validate_decision.py
+    - python3       # required by agent_gate.sh and validators
     - sshpass       # optional, only for password auth
     - timeout       # optional, used by runner.sh per-host timeout when available
 ---
@@ -35,7 +35,7 @@ It is not an Ansible clone, not a hidden playbook runner, and not a growing pile
 Recommended loop:
 
 ```text
-observe -> classify -> hypothesize -> choose primitive -> validate decision -> gate -> execute -> verify -> continue, stop, or escalate
+observe -> classify -> hypothesize -> choose primitive -> validate decision/policy -> gate -> execute -> verify -> continue, stop, or escalate
 ```
 
 The skill provides safe, composable Linux operation primitives. The Agent remains responsible for diagnosis, sequencing, confidence assessment, verification, and deciding the next action.
@@ -47,6 +47,7 @@ The skill provides safe, composable Linux operation primitives. The Agent remain
 - `exec.sh` is the low-level SSH syscall.
 - `agent_gate.sh` is the generic runtime gate for AI Agent decision records.
 - `validate_decision.py` is the strict, dependency-free decision record validator.
+- `validate_autonomy.py` is the dependency-free autonomy policy validator.
 - `runner.sh` is the concurrent fleet executor.
 - `select_hosts.sh` is the targeting layer.
 - `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh` are Linux operation primitives.
@@ -56,8 +57,9 @@ The skill provides safe, composable Linux operation primitives. The Agent remain
 - `common.sh` provides config loading, JSON output, redaction, policy checks, and audit logging.
 - `autonomy.example.yaml` describes local autonomy boundaries.
 - `schemas/decision-record.schema.json` defines concise auditable decision records.
+- `schemas/audit-event.schema.json` defines the generic audit event contract.
 - `examples/decision-record.observe.json` provides a generic dry-run example.
-- `tests/agent_gate_tests.sh` verifies generic gate allow/block behavior without SSH.
+- `tests/agent_gate_tests.sh` verifies generic gate allow/block and execute/verify/rollback behavior without SSH.
 
 Prefer semantic primitives over raw shell when a primitive exists. Do not force a fixed workflow. Let the Agent combine primitives based on observations.
 
@@ -81,6 +83,7 @@ If behavior is reusable, express it as one of these instead:
 - a decision-record contract,
 - a verification/rollback contract,
 - a runtime gate check,
+- a validator,
 - or an Agent reasoning pattern in docs.
 
 The runtime code must remain business-agnostic.
@@ -104,7 +107,7 @@ The model should not treat prior knowledge as proof. Live observations win.
 
 ## Autonomy and Unattended Operation
 
-Unattended operation must be optimized through **autonomy levels, decision records, runtime validation, runtime gating, verification, and escalation**, not through fixed repair scripts.
+Unattended operation must be optimized through **autonomy levels, decision records, runtime validation, runtime gating, verification, rollback contracts, and escalation**, not through fixed repair scripts.
 
 Reference files:
 
@@ -113,8 +116,10 @@ docs/agent-autonomy.md
 docs/agent-autonomy.zh-CN.md
 autonomy.example.yaml
 schemas/decision-record.schema.json
+schemas/audit-event.schema.json
 examples/decision-record.observe.json
 scripts/validate_decision.py
+scripts/validate_autonomy.py
 scripts/agent_gate.sh
 tests/agent_gate_tests.sh
 ```
@@ -132,10 +137,11 @@ Default unattended mode should be **L1 observe-only**.
 
 Before any unattended action beyond read-only observation, the Agent should produce a concise decision record. This is not a chain-of-thought dump; it is an auditable operational summary.
 
-Validate a decision record:
+Validate inputs:
 
 ```bash
 python3 skills/ssh/scripts/validate_decision.py skills/ssh/examples/decision-record.observe.json --quiet
+python3 skills/ssh/scripts/validate_autonomy.py skills/ssh/autonomy.example.yaml --quiet
 ```
 
 Dry-run the runtime gate:
@@ -162,23 +168,27 @@ The gate is generic. It validates and dispatches primitives; it does not know bu
 `agent_gate.sh` performs these checks before execution:
 
 1. Calls `validate_decision.py` to enforce the generic decision contract and OPSEC checks.
-2. Reads local autonomy policy when available.
-3. Checks autonomy level, risk, environment, host count, and primitive allowance.
-4. Blocks raw `exec.sh` unless explicitly approved.
-5. Executes exactly one primitive action when `--execute` is used.
-6. Runs generic `verification_actions` when supplied.
-7. Optionally runs generic `rollback_actions` after failed verification.
-8. Writes a redacted decision audit file.
+2. Calls `validate_autonomy.py` when a policy file exists.
+3. Reads local autonomy policy when available.
+4. Checks autonomy level, risk, environment, host count, and primitive allowance.
+5. Blocks raw `exec.sh` unless explicitly approved.
+6. Executes exactly one primitive action when `--execute` is used.
+7. Runs generic `verification_actions` when supplied.
+8. Optionally runs generic `rollback_actions` after failed verification.
+9. Writes a redacted decision audit file.
 
-The validator checks:
+The test matrix covers:
 
-- required fields,
-- allowed enums,
-- unknown top-level keys,
-- primitive name syntax,
-- guardrail shape,
-- verification and rollback action shape,
-- sensitive-looking tokens, private key markers, `.ssh`, `.secrets`, `user@host`, and IP addresses.
+- L1 observe allow,
+- raw `exec.sh` block,
+- production L3 block without confirmation,
+- host count block,
+- OPSEC leakage block,
+- unknown field block,
+- invalid autonomy policy block,
+- execute success plus verification success,
+- verification failure plus rollback,
+- primary action failure stop.
 
 ---
 
@@ -198,46 +208,6 @@ Never commit real `hosts.yaml`, `autonomy.yaml`, or `.secrets/` content.
 
 ---
 
-## Preferred Agent Workflow
-
-### 1. List or select hosts
-
-```bash
-bash skills/ssh/scripts/list_hosts.sh
-bash skills/ssh/scripts/list_hosts.sh --check
-bash skills/ssh/scripts/select_hosts.sh --target "tag=<tag>,role=<role>" --csv
-bash skills/ssh/scripts/select_hosts.sh --env <env> --region <region> --role <role> --csv
-```
-
-### 2. Observe first
-
-```bash
-bash skills/ssh/scripts/sys.sh <host> summary
-bash skills/ssh/scripts/sys.sh <host> disk
-bash skills/ssh/scripts/proc.sh <host> top 30
-bash skills/ssh/scripts/net.sh <host> ports 100
-bash skills/ssh/scripts/service.sh <host> status <service>
-```
-
-### 3. Build and validate a decision record
-
-```bash
-python3 skills/ssh/scripts/validate_decision.py <decision.json> --quiet
-```
-
-### 4. Gate autonomous actions
-
-```bash
-bash skills/ssh/scripts/agent_gate.sh --decision <decision.json> --policy <autonomy.yaml> --dry-run
-bash skills/ssh/scripts/agent_gate.sh --decision <decision.json> --policy <autonomy.yaml> --execute
-```
-
-### 5. Verify and stop or escalate
-
-Every state-changing action must define verification. If verification fails, evidence conflicts, rollback is missing, or production risk appears, stop and escalate.
-
----
-
 ## Security Rules (MUST follow)
 
 1. **Never output credentials or infrastructure identifiers**: IPs, usernames, passwords, key paths, `.secrets` paths, private hostnames, and key contents must not appear in conversation.
@@ -246,7 +216,7 @@ Every state-changing action must define verification. If verification fails, evi
 4. **Observe before changing**: for unclear problems, use observation primitives before applying changes.
 5. **Use primitives first**: prefer semantic primitives over raw `exec.sh` when available.
 6. **Use `agent_gate.sh` for Agent-owned unattended actions** when a decision record is available.
-7. **Use `validate_decision.py` before executing Agent-generated decisions.**
+7. **Validate Agent-generated decisions and autonomy policy before execution.**
 8. **Use runner for fleets** with `--parallel`, `--timeout`, and preferably `--fail-fast`.
 9. **Use locks for write operations** when doing multi-step writes on a host.
 10. **Confirm destructive commands**: high-risk operations require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
@@ -264,12 +234,13 @@ Every state-changing action must define verification. If verification fails, evi
 ## Local Quality Checks
 
 ```bash
-bash -n skills/ssh/scripts/*.sh
-python3 -m py_compile skills/ssh/scripts/validate_decision.py
+bash -n skills/ssh/scripts/*.sh skills/ssh/tests/*.sh
+python3 -m py_compile skills/ssh/scripts/validate_decision.py skills/ssh/scripts/validate_autonomy.py
 bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.example.yaml
+python3 skills/ssh/scripts/validate_autonomy.py skills/ssh/autonomy.example.yaml --quiet
 python3 skills/ssh/scripts/validate_decision.py skills/ssh/examples/decision-record.observe.json --quiet
 bash skills/ssh/scripts/agent_gate.sh --decision skills/ssh/examples/decision-record.observe.json --policy skills/ssh/autonomy.example.yaml --dry-run
 bash skills/ssh/tests/agent_gate_tests.sh
 ```
 
-GitHub Actions runs syntax checks, example inventory validation, decision validation, generic agent gate dry-run, the generic gate test matrix, and advisory ShellCheck.
+GitHub Actions runs syntax checks, example inventory validation, autonomy policy validation, decision validation, generic agent gate dry-run, the generic gate test matrix, and advisory ShellCheck.

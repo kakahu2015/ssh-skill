@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kakahu2015/ssh-skill/schemas/audit-event.schema.json",
+  "title": "SSH Skill Audit Event",
+  "description": "Generic audit event emitted by ssh-skill primitives and agent_gate. Audit events must be redacted before persistence.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["time", "run_id", "host", "action", "success", "exit_code", "duration_ms", "command"],
+  "properties": {
+    "time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string",
+      "minLength": 1
+    },
+    "success": {
+      "type": "boolean"
+    },
+    "exit_code": {
+      "type": "integer"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "command": {
+      "type": "string",
+      "description": "Redacted command or primitive summary. Must not include credentials or private infrastructure identifiers."
+    },
+    "decision_file": {
+      "type": "string"
+    },
+    "policy_file": {
+      "type": "string"
+    },
+    "autonomy_level": {
+      "type": "string",
+      "enum": ["L0", "L1", "L2", "L3", "L4", "L5"]
+    },
+    "risk": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "forbidden"]
+    }
+  }
+}

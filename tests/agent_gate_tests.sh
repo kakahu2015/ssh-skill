@@ -8,6 +8,8 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 export AUDIT_DIR="$TMP_DIR/audit"
 export HOSTS_YAML="$ROOT/hosts.example.yaml"
+export AGENT_GATE_PRIMITIVES_DIR="$ROOT/tests/fixtures/primitives"
+export AGENT_GATE_TEST_STATE="$TMP_DIR/state.log"
 
 pass_count=0
 
@@ -65,7 +67,7 @@ write_decision() {
     "primitive": "$primitive",
     "args": $args_json,
     "command": "$primitive generic args",
-    "expected_effect": "dry-run validation only"
+    "expected_effect": "generic validation only"
   },
   "guardrails": {
     "requires_confirmation": $requires_confirmation,
@@ -80,7 +82,49 @@ write_decision() {
   "verification_actions": [],
   "rollback": [],
   "rollback_actions": [],
-  "stop_condition": "dry-run completes or blocks as expected",
+  "stop_condition": "gate completes or blocks as expected",
+  "confidence": "high"
+}
+JSON
+}
+
+write_mock_decision() {
+  local path="$1" action="$2" verify="$3" rollback="$4" risk="${5:-low}" level="${6:-L1}"
+  cat >"$path" <<JSON
+{
+  "intent": "generic mock execution test",
+  "autonomy_level": "$level",
+  "target_scope": {
+    "hosts": ["demo-host-01"],
+    "environment": "dev"
+  },
+  "observations": ["generic mock primitive selected"],
+  "hypothesis": "agent_gate execute/verify/rollback behavior can be validated locally",
+  "risk": "$risk",
+  "action": {
+    "primitive": "$action",
+    "args": ["action"],
+    "command": "$action action",
+    "expected_effect": "mock action result"
+  },
+  "guardrails": {
+    "requires_confirmation": false,
+    "requires_lock": false,
+    "rollback_available": true,
+    "policy_risk": "$risk",
+    "max_hosts": 1,
+    "timeout_sec": 30,
+    "output_limit": "bounded"
+  },
+  "verification": ["mock verification primitive returns expected result"],
+  "verification_actions": [
+    {"primitive": "$verify", "args": ["verify"], "expected_effect": "mock verification result"}
+  ],
+  "rollback": ["run generic rollback primitive if verification fails"],
+  "rollback_actions": [
+    {"primitive": "$rollback", "args": ["rollback"], "expected_effect": "mock rollback result"}
+  ],
+  "stop_condition": "mock execution completes or fails as expected",
   "confidence": "high"
 }
 JSON
@@ -94,29 +138,33 @@ expect_success \
   python3 "$ROOT/scripts/validate_decision.py" "$VALID_DECISION" --quiet
 
 expect_success \
+  "validate autonomy example policy" \
+  python3 "$ROOT/scripts/validate_autonomy.py" "$ROOT/autonomy.example.yaml" --quiet
+
+expect_success \
   "agent_gate allows L1 observe dry-run" \
-  bash "$ROOT/scripts/agent_gate.sh" --decision "$VALID_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$VALID_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 RAW_EXEC_DECISION="$TMP_DIR/raw-exec.json"
 write_decision "$RAW_EXEC_DECISION" "L1" "low" "dev" "exec.sh" '["demo-host-01", "uptime"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
   "agent_gate blocks raw exec without explicit approval" \
   "raw_exec_blocked" \
-  bash "$ROOT/scripts/agent_gate.sh" --decision "$RAW_EXEC_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$RAW_EXEC_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 PROD_L3_DECISION="$TMP_DIR/prod-l3.json"
 write_decision "$PROD_L3_DECISION" "L3" "medium" "prod" "service.sh" '["demo-host-01", "restart", "generic-service"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
   "agent_gate blocks production L3 without confirmation" \
   "autonomy_blocked" \
-  bash "$ROOT/scripts/agent_gate.sh" --decision "$PROD_L3_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$PROD_L3_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 HOST_LIMIT_DECISION="$TMP_DIR/host-limit.json"
 write_decision "$HOST_LIMIT_DECISION" "L1" "low" "dev" "sys.sh" '["demo-host-01", "summary"]' 1 false '["demo-host-01", "demo-host-02"]'
 expect_failure_contains \
   "agent_gate blocks host count above max_hosts" \
   "exceeds max_hosts" \
-  bash "$ROOT/scripts/agent_gate.sh" --decision "$HOST_LIMIT_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$HOST_LIMIT_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 SENSITIVE_DECISION="$TMP_DIR/sensitive.json"
 write_decision "$SENSITIVE_DECISION" "L1" "low" "dev" "sys.sh" '["demo-host-01", "summary"]' 1 false '["demo-host-01"]'
@@ -145,5 +193,46 @@ expect_failure_contains \
   "validate_decision blocks unknown top-level keys" \
   "unknown top-level keys" \
   python3 "$ROOT/scripts/validate_decision.py" "$UNKNOWN_KEY_DECISION" --quiet
+
+INVALID_POLICY="$TMP_DIR/invalid-autonomy.yaml"
+cp "$ROOT/autonomy.example.yaml" "$INVALID_POLICY"
+python3 - "$INVALID_POLICY" <<'PY'
+import sys
+p = sys.argv[1]
+text = open(p).read().replace('default_level: L1', 'default_level: L9')
+open(p, 'w').write(text)
+PY
+expect_failure_contains \
+  "validate_autonomy blocks invalid levels" \
+  "default_level" \
+  python3 "$ROOT/scripts/validate_autonomy.py" "$INVALID_POLICY" --quiet
+
+MOCK_OK_DECISION="$TMP_DIR/mock-ok.json"
+write_mock_decision "$MOCK_OK_DECISION" "generic_success.sh" "generic_success.sh" "generic_rollback.sh"
+expect_success \
+  "agent_gate execute success with verification success" \
+  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_OK_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --confirm
+
+: > "$AGENT_GATE_TEST_STATE"
+MOCK_VERIFY_FAIL_DECISION="$TMP_DIR/mock-verify-fail.json"
+write_mock_decision "$MOCK_VERIFY_FAIL_DECISION" "generic_success.sh" "generic_fail.sh" "generic_rollback.sh"
+expect_failure_contains \
+  "agent_gate runs rollback when verification fails" \
+  "verification_failed" \
+  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_VERIFY_FAIL_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --confirm --rollback-on-failed-verification
+if grep -q '^rollback:rollback$' "$AGENT_GATE_TEST_STATE"; then
+  pass "rollback primitive recorded state"
+else
+  cat "$AGENT_GATE_TEST_STATE" >&2 || true
+  echo "FAIL: rollback primitive did not record state" >&2
+  exit 1
+fi
+
+MOCK_ACTION_FAIL_DECISION="$TMP_DIR/mock-action-fail.json"
+write_mock_decision "$MOCK_ACTION_FAIL_DECISION" "generic_fail.sh" "generic_success.sh" "generic_rollback.sh"
+expect_failure_contains \
+  "agent_gate stops on primary action failure" \
+  "action_failed" \
+  bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_ACTION_FAIL_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --confirm
 
 log "Completed $pass_count generic agent gate tests"
