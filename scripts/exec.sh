@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
 # OpenClaw SSH Skill - 通过 ControlMaster socket 执行远程命令
-# 用法: bash exec.sh <host|host1,host2,...> "command" [--confirm]
+# 用法: bash exec.sh <host|host1,host2,...> "command" [--confirm] [--sudo]
 set -euo pipefail
 
-HOST_NAMES="${1:?用法: exec.sh <host|host1,host2,...> <command> [--confirm]}"
+HOST_NAMES="${1:?用法: exec.sh <host|host1,host2,...> <command> [--confirm] [--sudo]}"
 REMOTE_CMD="${2:?缺少命令参数}"
-CONFIRM_FLAG="${3:-}"
+CONFIRM_FLAG=""
+SUDO_RETRY=0
+
+shift 2
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --confirm)
+            CONFIRM_FLAG="--confirm"; shift ;;
+        --sudo)
+            SUDO_RETRY=1; shift ;;
+        *)
+            echo "未知参数: $1" >&2
+            exit 2 ;;
+    esac
+done
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPTS_DIR/common.sh"
 
 HOST_COUNT=$(host_count_from_csv "$HOST_NAMES")
-policy_check_command "$REMOTE_CMD" "$HOST_COUNT" "$CONFIRM_FLAG"
+policy_check_command "$REMOTE_CMD" "$HOST_COUNT" "$CONFIRM_FLAG" "$HOST_NAMES"
 RUN_ID="${SSH_SKILL_RUN_ID:-$(make_run_id)}"
 
 # 多主机兼容模式：仍支持逗号分隔，但输出聚合 JSON。
@@ -22,12 +36,16 @@ if echo "$HOST_NAMES" | grep -q ','; then
     OK=0
     FAILED=0
     RESULTS=()
+    PASS_FLAGS=()
+    [[ -n "$CONFIRM_FLAG" ]] && PASS_FLAGS+=("$CONFIRM_FLAG")
+    [[ "$SUDO_RETRY" -eq 1 ]] && PASS_FLAGS+=("--sudo")
+
     for HOST_NAME in "${HOSTS[@]}"; do
         HOST_NAME="$(echo "$HOST_NAME" | xargs)"
         [[ -z "$HOST_NAME" ]] && continue
         echo "[ssh-skill] 在主机 $HOST_NAME 执行..." >&2
         set +e
-        RESULT=$(SSH_SKILL_RUN_ID="$RUN_ID" bash "$0" "$HOST_NAME" "$REMOTE_CMD" "$CONFIRM_FLAG")
+        RESULT=$(SSH_SKILL_RUN_ID="$RUN_ID" bash "$0" "$HOST_NAME" "$REMOTE_CMD" "${PASS_FLAGS[@]}")
         RC=$?
         set -e
         RESULTS+=("$RESULT")
@@ -40,7 +58,7 @@ if echo "$HOST_NAMES" | grep -q ','; then
 
     echo "{"
     echo "  \"success\": $([ "$FAILED" -eq 0 ] && echo true || echo false),"
-    echo "  \"run_id\": \"$(json_escape "$RUN_ID")\","
+    echo "  \"run_id\": \"$(safe_json_string "$RUN_ID")\","
     echo "  \"total\": $((OK + FAILED)),"
     echo "  \"ok\": $OK,"
     echo "  \"failed\": $FAILED,"
@@ -98,22 +116,24 @@ set -e
 
 STDOUT_CONTENT=$(cat "$STDOUT_FILE")
 STDERR_CONTENT=$(cat "$STDERR_FILE")
+ERROR_FIELD=""
+SUDO_USED=false
 
-# 权限自动适配：普通 Permission denied 时尝试 sudo。
-# sudo 本身仍受远端 sudoers 控制，不嵌入密码。
-if [[ $EXIT_CODE -ne 0 ]] && echo "$STDERR_CONTENT" | grep -q "Permission denied"; then
-    echo "[ssh-skill] 检测到权限不足，尝试 sudo 重新执行..." >&2
-    SUDO_CMD="sudo bash -lc $(printf '%q' "$FULL_CMD")"
-    set +e
-    run_ssh "$SUDO_CMD"
-    EXIT_CODE=$?
-    set -e
-    STDOUT_CONTENT=$(cat "$STDOUT_FILE")
-    STDERR_CONTENT=$(cat "$STDERR_FILE")
-    if [[ $EXIT_CODE -eq 0 ]]; then
-        echo "[ssh-skill] sudo 执行成功" >&2
-    else
-        echo "[ssh-skill] sudo 重试后仍然失败" >&2
+# 权限不足时不再默认自动 sudo；只有显式 --sudo 或 SSH_SKILL_ALLOW_SUDO_RETRY=yes 才重试。
+if [[ $EXIT_CODE -ne 0 ]] && echo "$STDERR_CONTENT" | grep -qi "Permission denied"; then
+    ERROR_FIELD="permission_denied"
+    if [[ "$SUDO_RETRY" -eq 1 || "${SSH_SKILL_ALLOW_SUDO_RETRY:-}" == "yes" ]]; then
+        SUDO_CMD="sudo bash -lc $(printf '%q' "$FULL_CMD")"
+        policy_check_command "$SUDO_CMD" "$HOST_COUNT" "$CONFIRM_FLAG" "$HOST_NAME"
+        echo "[ssh-skill] 检测到权限不足，按显式授权尝试 sudo 重新执行..." >&2
+        set +e
+        run_ssh "$SUDO_CMD"
+        EXIT_CODE=$?
+        set -e
+        STDOUT_CONTENT=$(cat "$STDOUT_FILE")
+        STDERR_CONTENT=$(cat "$STDERR_FILE")
+        SUDO_USED=true
+        [[ $EXIT_CODE -eq 0 ]] && ERROR_FIELD=""
     fi
 fi
 
@@ -128,11 +148,13 @@ write_audit_event "$RUN_ID" "$HOST_NAME" "exec" "$SUCCESS" "$EXIT_CODE" "$DURATI
 cat <<JSON
 {
   "success": $SUCCESS,
-  "run_id": "$(json_escape "$RUN_ID")",
-  "host": "$(json_escape "$HOST_NAME")",
-  "risk": "$(policy_risk_for_command "$REMOTE_CMD")",
+  "run_id": "$(safe_json_string "$RUN_ID")",
+  "host": "$(safe_json_string "$HOST_NAME")",
+  "risk": "$(safe_json_string "$(policy_risk_for_command "$REMOTE_CMD")")",
+  "sudo_used": $SUDO_USED,
   "exit_code": $EXIT_CODE,
   "duration_ms": $DURATION_MS,
+  "error": "$(safe_json_string "$ERROR_FIELD")",
   "stdout": "$(json_escape "$STDOUT_CONTENT")",
   "stderr": "$(json_escape "$STDERR_CONTENT")"
 }
