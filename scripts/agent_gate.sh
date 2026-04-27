@@ -186,8 +186,13 @@ run_primitive_action() {
 }
 
 require_python3
+VALIDATION_ERR="$(mktemp)"
 ENV_FILE="$(mktemp)"
-trap 'rm -f "$ENV_FILE"' EXIT
+trap 'rm -f "$VALIDATION_ERR" "$ENV_FILE"' EXIT
+
+if ! python3 "$SCRIPTS_DIR/validate_decision.py" "$DECISION_FILE" --quiet 2>"$VALIDATION_ERR"; then
+    die_json "decision_invalid" "Decision record failed validation: $(cat "$VALIDATION_ERR")"
+fi
 
 python3 - "$DECISION_FILE" "$POLICY_FILE" "$ENV_FILE" <<'PY'
 import json
@@ -199,69 +204,16 @@ from pathlib import Path
 decision_path = Path(sys.argv[1])
 policy_path = Path(sys.argv[2])
 env_path = Path(sys.argv[3])
-
-try:
-    decision = json.loads(decision_path.read_text())
-except Exception as exc:
-    raise SystemExit(f"invalid decision JSON: {exc}")
-
-required = [
-    "intent", "autonomy_level", "observations", "hypothesis", "risk",
-    "action", "guardrails", "verification", "stop_condition", "confidence"
-]
-missing = [key for key in required if key not in decision]
-if missing:
-    raise SystemExit("missing required decision fields: " + ", ".join(missing))
-
-levels = {"L0", "L1", "L2", "L3", "L4", "L5"}
-risks = {"low", "medium", "high", "forbidden"}
-confidences = {"low", "medium", "high"}
-if decision["autonomy_level"] not in levels:
-    raise SystemExit("invalid autonomy_level")
-if decision["risk"] not in risks:
-    raise SystemExit("invalid risk")
-if decision["confidence"] not in confidences:
-    raise SystemExit("invalid confidence")
-if not isinstance(decision["observations"], list) or not decision["observations"]:
-    raise SystemExit("observations must be a non-empty array")
-if not isinstance(decision["verification"], list) or not decision["verification"]:
-    raise SystemExit("verification must be a non-empty array")
+decision = json.loads(decision_path.read_text())
 
 action = decision["action"]
-if not isinstance(action, dict) or not action.get("primitive"):
-    raise SystemExit("action.primitive is required")
-args = action.get("args", [])
-if args is None:
-    args = []
-if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
-    raise SystemExit("action.args must be an array of strings")
-
-guardrails = decision["guardrails"]
-if not isinstance(guardrails, dict):
-    raise SystemExit("guardrails must be an object")
-for key in ("requires_confirmation", "requires_lock", "rollback_available"):
-    if key not in guardrails or not isinstance(guardrails[key], bool):
-        raise SystemExit(f"guardrails.{key} must be a boolean")
-
+args = action.get("args") or []
 target_scope = decision.get("target_scope") or {}
-if not isinstance(target_scope, dict):
-    raise SystemExit("target_scope must be an object")
 hosts = target_scope.get("hosts") or []
-if not isinstance(hosts, list) or not all(isinstance(x, str) for x in hosts):
-    raise SystemExit("target_scope.hosts must be an array of strings")
 environment = str(target_scope.get("environment") or "unknown").lower()
-
+guardrails = decision["guardrails"]
 verification_actions = decision.get("verification_actions") or []
 rollback_actions = decision.get("rollback_actions") or []
-for group_name, group in (("verification_actions", verification_actions), ("rollback_actions", rollback_actions)):
-    if not isinstance(group, list):
-        raise SystemExit(f"{group_name} must be an array")
-    for item in group:
-        if not isinstance(item, dict) or not item.get("primitive"):
-            raise SystemExit(f"{group_name} entries require primitive")
-        item_args = item.get("args", [])
-        if not isinstance(item_args, list) or not all(isinstance(x, str) for x in item_args):
-            raise SystemExit(f"{group_name}.args must be an array of strings")
 
 policy_default_level = "L1"
 policy_env_max_level = "L1"
@@ -297,7 +249,6 @@ if policy_file_found:
             if level_match:
                 policy_env_max_level = level_match.group(1)
 
-
 def q(value):
     return shlex.quote(str(value))
 
@@ -325,11 +276,11 @@ lines.append(f"POLICY_REQUIRE_VERIFICATION={q(str(policy_require_verification).l
 lines.append(f"VERIFICATION_ACTION_COUNT={q(str(len(verification_actions)))}")
 for idx, item in enumerate(verification_actions):
     lines.append(f"VERIFY_{idx}_PRIMITIVE={q(item['primitive'])}")
-    lines.append(arr(f"VERIFY_{idx}_ARGS", item.get("args", [])))
+    lines.append(arr(f"VERIFY_{idx}_ARGS", item.get("args") or []))
 lines.append(f"ROLLBACK_ACTION_COUNT={q(str(len(rollback_actions)))}")
 for idx, item in enumerate(rollback_actions):
     lines.append(f"ROLLBACK_{idx}_PRIMITIVE={q(item['primitive'])}")
-    lines.append(arr(f"ROLLBACK_{idx}_ARGS", item.get("args", [])))
+    lines.append(arr(f"ROLLBACK_{idx}_ARGS", item.get("args") or []))
 
 env_path.write_text("\n".join(lines) + "\n")
 PY
