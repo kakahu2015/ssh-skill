@@ -12,10 +12,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax check
         run: |
-          bash -n scripts/*.sh
-          python3 -m py_compile scripts/validate_decision.py
+          bash -n scripts/*.sh tests/*.sh
+          python3 -m py_compile scripts/validate_decision.py scripts/validate_autonomy.py
       - name: Validate example inventory
         run: bash scripts/validate_hosts.sh hosts.example.yaml
+      - name: Validate autonomy policy example
+        run: python3 scripts/validate_autonomy.py autonomy.example.yaml --quiet
       - name: Validate decision record example
         run: python3 scripts/validate_decision.py examples/decision-record.observe.json --quiet
       - name: Validate generic agent gate dry-run
