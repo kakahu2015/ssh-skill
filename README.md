@@ -1,10 +1,11 @@
 # SSH/Linux Ops Skill (Agent-native)
 
+[Agent 自治模型](docs/agent-autonomy.zh-CN.md) | [Agent Autonomy Model](docs/agent-autonomy.md)  
 [中文 v1.3.0 安全加固说明](docs/ssh-skill-v1.3.0-hardening.zh-CN.md) | [English v1.3.0 Safety Hardening Notes](docs/ssh-skill-v1.3.0-hardening.md)
 
 OpenClaw 的通用 Linux 运维 skill，基于系统 `ssh` + ControlMaster，为 AI Agent 提供一组 **可组合、可审计、可批量执行的 Linux 操作 primitives**。
 
-目标不是把 Ansible playbook 换成 bash playbook，而是给 Agent 一套安全的 Linux 操作积木：Agent 自己观察、推理、选择下一步；skill 负责连接、执行、批量、脱敏、策略拦截、审计和结果落盘。
+目标不是把 Ansible playbook 换成 bash playbook，也不是堆一堆固定任务脚本。这个项目的目标是给大模型一个安全、结构化、可审计的远程 Linux 操作面：**skill 负责安全执行，Agent 负责观察、推理、决策和验证**。
 
 ## 设计原则
 
@@ -12,11 +13,13 @@ OpenClaw 的通用 Linux 运维 skill，基于系统 `ssh` + ControlMaster，为
 |------|------|
 | Agent 自主组合 | 不内置僵硬流程，不强行规定“部署步骤” |
 | Primitive-first | 提供观察、文件、进程、网络、包管理、服务、锁等通用操作 |
+| AI reasoning first | 让模型使用 Linux/运维知识推理，但必须用实时观测验证假设 |
 | SSH as syscall | `exec.sh` 是底层 syscall，其他脚本是更安全的 Linux primitives |
 | 结构化结果 | 返回 JSON，方便 Agent 继续判断 |
+| 有界无人值守 | 无人值守不是无限自动化，而是受 autonomy level、policy、verification 约束 |
 | 批量安全 | `runner.sh` 提供并发、超时、失败率控制、结果落盘 |
 | 显式提权 | `Permission denied` 后不会默认 sudo；必须 `--sudo` 或显式环境变量授权 |
-| 配置隔离 | `hosts.example.yaml` 可提交；真实 `hosts.yaml` 和 `.secrets/` 不提交 |
+| 配置隔离 | `hosts.example.yaml` 可提交；真实 `hosts.yaml`、`autonomy.yaml` 和 `.secrets/` 不提交 |
 
 ## 快速开始
 
@@ -74,7 +77,7 @@ bash scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50
 Agent 不需要死板执行 playbook。推荐循环是：
 
 ```text
-observe -> reason -> choose primitive -> execute -> inspect result -> continue/stop
+observe -> classify -> hypothesize -> choose primitive -> execute under guardrails -> verify -> continue/stop/escalate
 ```
 
 例子：排查某台机器 Caddy 异常：
@@ -88,7 +91,60 @@ bash scripts/net.sh demo-edge-01 listen 443
 bash scripts/file.sh demo-edge-01 stat /etc/caddy/Caddyfile
 ```
 
-Agent 根据每一步 JSON 输出决定下一步，而不是照固定剧本执行。
+Agent 可以使用自己对 Linux、systemd、网络、文件系统、包管理器和常见服务的知识来选择下一步，但必须用每一步 JSON 输出验证假设，而不是照固定剧本执行。
+
+## AI 自治与无人值守
+
+无人值守方向不等于把脚本任务化。正确做法是把 skill 保持为 primitives，让 Agent 结合大模型知识和实时观测自主推理，同时用策略约束边界。
+
+相关文件：
+
+```text
+docs/agent-autonomy.zh-CN.md
+docs/agent-autonomy.md
+autonomy.example.yaml
+schemas/decision-record.schema.json
+```
+
+默认无人值守等级建议是 **L1 观察模式**：只允许 bounded read-only primitives。L2/L3 必须通过本地 `autonomy.yaml` 显式配置，并且需要 decision record、verification 和 policy guard。
+
+自治等级：
+
+| Level | 名称 | 含义 |
+|---|---|---|
+| L0 | Advisory | 不远程执行，只解释和规划 |
+| L1 | Observe | 只读观察，有限日志和状态检查 |
+| L2 | Safe self-heal | 低风险可逆动作，例如重连、刷新 facts、备份 |
+| L3 | Bounded change | 非生产、有验证、有边界的中风险变更 |
+| L4 | Privileged/prod-impacting | 特权或生产影响动作，必须显式确认 |
+| L5 | Forbidden | 禁止无人值守执行 |
+
+本地无人值守策略示例：
+
+```bash
+cp autonomy.example.yaml autonomy.yaml
+```
+
+Agent 在执行超出只读观察的动作前，应生成 concise decision record，而不是暴露长篇推理链：
+
+```json
+{
+  "intent": "restore web service availability",
+  "autonomy_level": "L2",
+  "observations": ["caddy service is inactive", "port 443 is not listening"],
+  "hypothesis": "service stopped or failed during reload",
+  "risk": "medium",
+  "action": { "primitive": "service.sh", "command": "status caddy" },
+  "guardrails": {
+    "requires_confirmation": false,
+    "requires_lock": false,
+    "rollback_available": false
+  },
+  "verification": ["check service status", "check port 443 listen state"],
+  "stop_condition": "service active and port 443 listening, or policy blocks change",
+  "confidence": "medium"
+}
+```
 
 ## Inventory 和 secrets
 
@@ -103,6 +159,7 @@ hosts.example.yaml
 
 ```text
 hosts.yaml
+autonomy.yaml
 .secrets/<host>.env
 ```
 
