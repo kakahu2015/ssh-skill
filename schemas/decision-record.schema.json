@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/kakahu2015/ssh-skill/schemas/decision-record.schema.json",
   "title": "SSH Skill Agent Decision Record",
-  "description": "A concise, auditable operational decision summary for AI-agent-driven SSH operations. This is not a chain-of-thought log.",
+  "description": "A concise, auditable operational decision summary for AI-agent-driven SSH operations. This is not a chain-of-thought log and must not contain credentials or private infrastructure identifiers.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -21,7 +21,7 @@
     "intent": {
       "type": "string",
       "minLength": 1,
-      "description": "The operational goal, e.g. triage web outage or restore non-prod service availability."
+      "description": "The operational goal, stated generically and without secrets."
     },
     "autonomy_level": {
       "type": "string",
@@ -73,7 +73,8 @@
       "properties": {
         "primitive": {
           "type": "string",
-          "description": "Primitive script to use, e.g. sys.sh, service.sh, runner.sh."
+          "pattern": "^[A-Za-z0-9_.-]+\\.sh$",
+          "description": "Primitive script to use, e.g. sys.sh, service.sh, runner.sh. No path separators."
         },
         "args": {
           "type": "array",
@@ -112,7 +113,7 @@
         },
         "output_limit": {
           "type": "string",
-          "description": "Bounded output rule, e.g. tail -100 or primitive limit 50."
+          "description": "Bounded output rule, e.g. primitive limit 50 or tail -100."
         }
       }
     },
@@ -123,14 +124,28 @@
         "type": "string",
         "minLength": 1
       },
-      "description": "Post-action checks. State-changing actions must define verification."
+      "description": "Post-action checks in natural-language summary form. State-changing actions must define verification."
+    },
+    "verification_actions": {
+      "type": "array",
+      "description": "Optional executable primitive checks for agent_gate.sh. These must remain generic primitives, not business workflows.",
+      "items": {
+        "$ref": "#/$defs/primitive_action"
+      }
     },
     "rollback": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "Optional rollback steps or references to backups."
+      "description": "Optional rollback step summaries or references to backups."
+    },
+    "rollback_actions": {
+      "type": "array",
+      "description": "Optional executable primitive rollback actions for agent_gate.sh. These must remain generic primitives, not business workflows.",
+      "items": {
+        "$ref": "#/$defs/primitive_action"
+      }
     },
     "stop_condition": {
       "type": "string",
@@ -145,6 +160,26 @@
     "escalation_reason": {
       "type": "string",
       "description": "Reason to ask a human or require explicit confirmation."
+    }
+  },
+  "$defs": {
+    "primitive_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primitive"],
+      "properties": {
+        "primitive": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+\\.sh$"
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "expected_effect": {
+          "type": "string"
+        }
+      }
     }
   }
 }
