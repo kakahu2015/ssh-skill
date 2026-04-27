@@ -14,6 +14,8 @@ jobs:
         run: bash -n scripts/*.sh
       - name: Validate example inventory
         run: bash scripts/validate_hosts.sh hosts.example.yaml
+      - name: Validate generic agent gate dry-run
+        run: bash scripts/agent_gate.sh --decision examples/decision-record.observe.json --policy autonomy.example.yaml --dry-run
       - name: ShellCheck advisory
         continue-on-error: true
         run: |

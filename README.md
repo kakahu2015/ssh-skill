@@ -1,10 +1,11 @@
 # SSH/Linux Ops Skill (Agent-native)
 
+[Agent 自治模型](docs/agent-autonomy.zh-CN.md) | [Agent Autonomy Model](docs/agent-autonomy.md)  
 [中文 v1.3.0 安全加固说明](docs/ssh-skill-v1.3.0-hardening.zh-CN.md) | [English v1.3.0 Safety Hardening Notes](docs/ssh-skill-v1.3.0-hardening.md)
 
 OpenClaw 的通用 Linux 运维 skill，基于系统 `ssh` + ControlMaster，为 AI Agent 提供一组 **可组合、可审计、可批量执行的 Linux 操作 primitives**。
 
-目标不是把 Ansible playbook 换成 bash playbook，而是给 Agent 一套安全的 Linux 操作积木：Agent 自己观察、推理、选择下一步；skill 负责连接、执行、批量、脱敏、策略拦截、审计和结果落盘。
+目标不是把 Ansible playbook 换成 bash playbook，也不是堆一堆固定任务脚本。这个项目的目标是给大模型一个安全、结构化、可审计的远程 Linux 操作面：**skill 负责安全执行，Agent 负责观察、推理、决策和验证**。
 
 ## 设计原则
 
@@ -12,11 +13,13 @@ OpenClaw 的通用 Linux 运维 skill，基于系统 `ssh` + ControlMaster，为
 |------|------|
 | Agent 自主组合 | 不内置僵硬流程，不强行规定“部署步骤” |
 | Primitive-first | 提供观察、文件、进程、网络、包管理、服务、锁等通用操作 |
+| AI reasoning first | 让模型使用 Linux/运维知识推理，但必须用实时观测验证假设 |
 | SSH as syscall | `exec.sh` 是底层 syscall，其他脚本是更安全的 Linux primitives |
 | 结构化结果 | 返回 JSON，方便 Agent 继续判断 |
+| 有界无人值守 | 无人值守不是无限自动化，而是受 autonomy level、policy、verification 约束 |
 | 批量安全 | `runner.sh` 提供并发、超时、失败率控制、结果落盘 |
 | 显式提权 | `Permission denied` 后不会默认 sudo；必须 `--sudo` 或显式环境变量授权 |
-| 配置隔离 | `hosts.example.yaml` 可提交；真实 `hosts.yaml` 和 `.secrets/` 不提交 |
+| 配置隔离 | `hosts.example.yaml` 可提交；真实 `hosts.yaml`、`autonomy.yaml` 和 `.secrets/` 不提交 |
 
 ## 快速开始
 
@@ -26,18 +29,18 @@ cp hosts.example.yaml hosts.yaml
 
 # 2. 准备真实连接信息。真实 IP/domain/key path 只放 .secrets/。
 mkdir -p .secrets
-cp .secrets/host.env.example .secrets/demo-edge-01.env
+cp .secrets/host.env.example .secrets/demo-host-01.env
 
 # 3. 校验 inventory。
 bash scripts/validate_hosts.sh hosts.yaml --allow-real-hosts
 
 # 4. 连接和观察。
 bash scripts/list_hosts.sh
-bash scripts/connect.sh demo-edge-01
-bash scripts/exec.sh demo-edge-01 "uptime"
+bash scripts/connect.sh demo-host-01
+bash scripts/exec.sh demo-host-01 "uptime"
 ```
 
-批量执行：
+批量只读观察：
 
 ```bash
 bash scripts/runner.sh --target "tag=production" --cmd "uptime" --parallel 20 --timeout 30 --fail-fast 20%
@@ -46,8 +49,8 @@ bash scripts/runner.sh --target "tag=production" --cmd "uptime" --parallel 20 --
 需要显式 sudo 重试时：
 
 ```bash
-bash scripts/exec.sh demo-edge-01 "cat /var/log/app.log | tail -50" --sudo
-bash scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50" --sudo
+bash scripts/exec.sh demo-host-01 "tail -50 <log-path>" --sudo
+bash scripts/runner.sh --target "tag=dev" --cmd "tail -50 <log-path>" --sudo
 ```
 
 ## 核心脚本
@@ -56,6 +59,7 @@ bash scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50
 |------|------|
 | SSH 连接复用 | `connect.sh`, `disconnect.sh` |
 | 自由命令执行 | `exec.sh` |
+| Agent 执行门禁 | `agent_gate.sh` |
 | 批量并发执行 | `runner.sh` |
 | 主机选择 | `select_hosts.sh` |
 | 系统观察 | `sys.sh`, `facts.sh`, `patrol.sh` |
@@ -74,21 +78,80 @@ bash scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50
 Agent 不需要死板执行 playbook。推荐循环是：
 
 ```text
-observe -> reason -> choose primitive -> execute -> inspect result -> continue/stop
+observe -> classify -> hypothesize -> choose primitive -> execute under guardrails -> verify -> continue/stop/escalate
 ```
 
-例子：排查某台机器 Caddy 异常：
+泛化示例：排查某台机器上的某个服务异常：
 
 ```bash
-bash scripts/sys.sh demo-edge-01 summary
-bash scripts/service.sh demo-edge-01 status caddy
-bash scripts/sys.sh demo-edge-01 journal caddy 100
-bash scripts/net.sh demo-edge-01 listen 80
-bash scripts/net.sh demo-edge-01 listen 443
-bash scripts/file.sh demo-edge-01 stat /etc/caddy/Caddyfile
+bash scripts/sys.sh <host> summary
+bash scripts/service.sh <host> status <service>
+bash scripts/sys.sh <host> journal <service> 100
+bash scripts/net.sh <host> listen <port>
+bash scripts/file.sh <host> stat <config-path>
 ```
 
-Agent 根据每一步 JSON 输出决定下一步，而不是照固定剧本执行。
+Agent 可以使用自己对 Linux、systemd、网络、文件系统、包管理器和服务运行机制的知识来选择下一步，但必须用每一步 JSON 输出验证假设，而不是照固定剧本执行。
+
+## AI 自治与无人值守
+
+无人值守方向不等于把脚本任务化。正确做法是把 skill 保持为 primitives，让 Agent 结合大模型知识和实时观测自主推理，同时用策略约束边界。
+
+相关文件：
+
+```text
+docs/agent-autonomy.zh-CN.md
+docs/agent-autonomy.md
+autonomy.example.yaml
+schemas/decision-record.schema.json
+examples/decision-record.observe.json
+```
+
+默认无人值守等级建议是 **L1 观察模式**：只允许 bounded read-only primitives。L2/L3 必须通过本地 `autonomy.yaml` 显式配置，并且需要 decision record、verification 和 policy guard。
+
+自治等级：
+
+| Level | 名称 | 含义 |
+|---|---|---|
+| L0 | Advisory | 不远程执行，只解释和规划 |
+| L1 | Observe | 只读观察，有限日志和状态检查 |
+| L2 | Safe self-heal | 低风险可逆动作，例如重连、刷新 facts、备份 |
+| L3 | Bounded change | 非生产、有验证、有边界的中风险变更 |
+| L4 | Privileged/prod-impacting | 特权或生产影响动作，必须显式确认 |
+| L5 | Forbidden | 禁止无人值守执行 |
+
+本地无人值守策略示例：
+
+```bash
+cp autonomy.example.yaml autonomy.yaml
+```
+
+Agent 在执行超出只读观察的动作前，应生成 concise decision record，而不是暴露长篇推理链。可用 `agent_gate.sh` 做运行时门禁：
+
+```bash
+bash scripts/agent_gate.sh --decision examples/decision-record.observe.json --policy autonomy.example.yaml --dry-run
+```
+
+泛化 decision record 形态：
+
+```json
+{
+  "intent": "collect bounded service health evidence",
+  "autonomy_level": "L1",
+  "observations": ["target selected from inventory metadata", "requested operation is read-only"],
+  "hypothesis": "bounded observation is needed before diagnosis or change",
+  "risk": "low",
+  "action": { "primitive": "service.sh", "args": ["<host>", "status", "<service>"] },
+  "guardrails": {
+    "requires_confirmation": false,
+    "requires_lock": false,
+    "rollback_available": false
+  },
+  "verification": ["agent_gate validates autonomy level, risk, primitive, and policy boundary"],
+  "stop_condition": "gate succeeds or reports an autonomy/policy/schema error",
+  "confidence": "high"
+}
+```
 
 ## Inventory 和 secrets
 
@@ -103,6 +166,7 @@ hosts.example.yaml
 
 ```text
 hosts.yaml
+autonomy.yaml
 .secrets/<host>.env
 ```
 
@@ -110,21 +174,21 @@ hosts.yaml
 
 ```yaml
 hosts:
-  prod-edge-01:
-    host: prod-edge-01                  # placeholder；真实 HOST 放 .secrets/prod-edge-01.env
+  demo-host-01:
+    host: demo-host-01                 # placeholder；真实 HOST 放 .secrets/demo-host-01.env
     port: 22
     user: ubuntu
     auth: key
-    key_path: /keys/prod-edge-01        # placeholder；真实 KEY_PATH 放 .secrets/prod-edge-01.env
-    default_workdir: /opt/myapp
-    provider: oci
-    region: us-west
+    key_path: /keys/demo-host-01       # placeholder；真实 KEY_PATH 放 .secrets/demo-host-01.env
+    default_workdir: /opt/workdir
+    provider: demo-provider
+    region: demo-region
     env: prod
-    role: edge
-    tags: [production, us-west, caddy, edge]
+    role: generic-role
+    tags: [production, generic]
 ```
 
-对应 `.secrets/prod-edge-01.env`：
+对应 `.secrets/demo-host-01.env`：
 
 ```bash
 HOST=203.0.113.10
@@ -160,8 +224,8 @@ bash scripts/validate_hosts.sh hosts.yaml --allow-real-hosts
 确认方式：
 
 ```bash
-bash scripts/exec.sh prod-edge-01 "sudo systemctl restart caddy" --confirm
-SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh prod-edge-01 "sudo systemctl restart caddy"
+bash scripts/exec.sh <host> "sudo systemctl restart <service>" --confirm
+SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh <host> "sudo systemctl restart <service>"
 ```
 
 ## sudo 行为
@@ -178,8 +242,8 @@ SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh prod-edge-01 "sudo systemctl restar
 显式授权才重试：
 
 ```bash
-bash scripts/exec.sh demo-edge-01 "cat /var/log/app.log | tail -50" --sudo
-SSH_SKILL_ALLOW_SUDO_RETRY=yes bash scripts/exec.sh demo-edge-01 "cat /var/log/app.log | tail -50"
+bash scripts/exec.sh <host> "tail -50 <log-path>" --sudo
+SSH_SKILL_ALLOW_SUDO_RETRY=yes bash scripts/exec.sh <host> "tail -50 <log-path>"
 ```
 
 sudo 重试前仍会重新走 policy guard。
@@ -215,9 +279,10 @@ sudo 重试前仍会重新走 policy guard。
 ```bash
 bash -n scripts/*.sh
 bash scripts/validate_hosts.sh hosts.example.yaml
+bash scripts/agent_gate.sh --decision examples/decision-record.observe.json --policy autonomy.example.yaml --dry-run
 ```
 
-GitHub Actions 会运行语法检查、示例 inventory 校验，以及非阻断的 ShellCheck advisory。
+GitHub Actions 会运行语法检查、示例 inventory 校验、generic agent gate dry-run，以及非阻断的 ShellCheck advisory。
 
 ## 与 Ansible 的区别
 
