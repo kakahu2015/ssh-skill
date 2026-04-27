@@ -143,28 +143,28 @@ expect_success \
 
 expect_success \
   "agent_gate allows L1 observe dry-run" \
-  AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$VALID_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$VALID_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 RAW_EXEC_DECISION="$TMP_DIR/raw-exec.json"
 write_decision "$RAW_EXEC_DECISION" "L1" "low" "dev" "exec.sh" '["demo-host-01", "uptime"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
   "agent_gate blocks raw exec without explicit approval" \
   "raw_exec_blocked" \
-  AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$RAW_EXEC_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$RAW_EXEC_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 PROD_L3_DECISION="$TMP_DIR/prod-l3.json"
 write_decision "$PROD_L3_DECISION" "L3" "medium" "prod" "service.sh" '["demo-host-01", "restart", "generic-service"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
   "agent_gate blocks production L3 without confirmation" \
   "autonomy_blocked" \
-  AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$PROD_L3_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$PROD_L3_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 HOST_LIMIT_DECISION="$TMP_DIR/host-limit.json"
 write_decision "$HOST_LIMIT_DECISION" "L1" "low" "dev" "sys.sh" '["demo-host-01", "summary"]' 1 false '["demo-host-01", "demo-host-02"]'
 expect_failure_contains \
   "agent_gate blocks host count above max_hosts" \
   "exceeds max_hosts" \
-  AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$HOST_LIMIT_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$HOST_LIMIT_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
 SENSITIVE_DECISION="$TMP_DIR/sensitive.json"
 write_decision "$SENSITIVE_DECISION" "L1" "low" "dev" "sys.sh" '["demo-host-01", "summary"]' 1 false '["demo-host-01"]'
