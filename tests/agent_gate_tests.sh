@@ -235,9 +235,8 @@ expect_failure_contains \
   "action_failed" \
   bash "$ROOT/scripts/agent_gate.sh" --decision "$MOCK_ACTION_FAIL_DECISION" --policy "$ROOT/autonomy.example.yaml" --execute --test-mode
 
-# ---- New v2.0 tests ----
+# ---- v2.0 tests ----
 
-# Unknown primitive -> semantic_blocked
 UNKNOWN_PRIM_DECISION="$TMP_DIR/unknown-prim.json"
 write_decision "$UNKNOWN_PRIM_DECISION" "L1" "low" "dev" "nonexistent.sh" '["demo-host-01", "test"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
@@ -245,7 +244,6 @@ expect_failure_contains \
   "semantic_blocked" \
   env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$UNKNOWN_PRIM_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
-# Unknown command -> semantic_blocked
 UNKNOWN_CMD_DECISION="$TMP_DIR/unknown-cmd.json"
 write_decision "$UNKNOWN_CMD_DECISION" "L1" "low" "dev" "sys.sh" '["demo-host-01", "nuke"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
@@ -253,15 +251,13 @@ expect_failure_contains \
   "semantic_blocked" \
   env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$UNKNOWN_CMD_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
-# Risk mismatch -> risk_mismatch
 RISK_MISMATCH_DECISION="$TMP_DIR/risk-mismatch.json"
-write_decision "$RISK_MISMATCH_DECISION" "L3" "low" "dev" "service.sh" '["demo-host-01", "restart", "caddy"]' 1 false '["demo-host-01"]'
+write_decision "$RISK_MISMATCH_DECISION" "L3" "low" "dev" "service.sh" '["demo-host-01", "restart", "generic-service"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
   "agent_gate detects risk mismatch" \
   "risk_mismatch" \
   env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$RISK_MISMATCH_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
-# Sensitive path -> path_blocked
 PATH_BLOCK_DECISION="$TMP_DIR/path-block.json"
 write_decision "$PATH_BLOCK_DECISION" "L1" "low" "dev" "file.sh" '["demo-host-01", "grep", "/etc/shadow", "root"]' 1 false '["demo-host-01"]'
 expect_failure_contains \
@@ -269,7 +265,6 @@ expect_failure_contains \
   "path_blocked" \
   env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$PATH_BLOCK_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
-# Corrupt rules file -> rules_load_failed
 CORRUPT_RULES="$TMP_DIR/corrupt-rules.json"
 echo "not valid json" > "$CORRUPT_RULES"
 CORRUPT_DECISION="$TMP_DIR/corrupt-prim.json"
@@ -277,21 +272,39 @@ cp "$VALID_DECISION" "$CORRUPT_DECISION"
 expect_failure_contains \
   "agent_gate fails on corrupt rules file" \
   "rules_load_failed" \
-  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" RULES_PATH="$CORRUPT_RULES" bash "$ROOT/scripts/agent_gate.sh" --decision "$CORRUPT_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run 2>&1 || true
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" RULES_PATH="$CORRUPT_RULES" bash "$ROOT/scripts/agent_gate.sh" --decision "$CORRUPT_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
 
-# Escalation file generated
+COMPOSITE_ALL_L1="$TMP_DIR/composite-all-l1.json"
+write_decision "$COMPOSITE_ALL_L1" "L1" "low" "dev" "composite.sh" '["demo-host-01", "all", "generic-service"]' 1 false '["demo-host-01"]'
+expect_failure_contains \
+  "agent_gate blocks composite all at L1" \
+  "semantic_blocked" \
+  env AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$COMPOSITE_ALL_L1" --policy "$ROOT/autonomy.example.yaml" --dry-run
+
 ESCALATION_AUDIT_DIR="$TMP_DIR/escalation-audit"
 mkdir -p "$ESCALATION_AUDIT_DIR"
 ESCALATE_DECISION="$TMP_DIR/escalate-decision.json"
 write_decision "$ESCALATE_DECISION" "L5" "forbidden" "prod" "sys.sh" '["demo-host-01", "summary"]' 1 false '["demo-host-01"]'
-AUDIT_DIR="$ESCALATION_AUDIT_DIR" bash "$ROOT/scripts/agent_gate.sh" --decision "$ESCALATE_DECISION" --dry-run 2>/dev/null || true
-# Check that escalation file was written
+AUDIT_DIR="$ESCALATION_AUDIT_DIR" bash "$ROOT/scripts/agent_gate.sh" --decision "$ESCALATE_DECISION" --dry-run >/dev/null 2>&1 || true
 ESCALATION_FILE=$(find "$ESCALATION_AUDIT_DIR" -name '*.escalation.json' 2>/dev/null | head -1)
 if [[ -n "$ESCALATION_FILE" ]]; then
   pass "escalation file generated on gate block"
 else
   echo "FAIL: no escalation file found in $ESCALATION_AUDIT_DIR" >&2
   find "$ESCALATION_AUDIT_DIR" -type f 2>/dev/null >&2 || true
+  exit 1
+fi
+
+AUDIT_HASH_DECISION="$TMP_DIR/audit-hash.json"
+cp "$VALID_DECISION" "$AUDIT_HASH_DECISION"
+expect_success \
+  "agent_gate writes audit hash metadata" \
+  env AUDIT_DIR="$TMP_DIR/hash-audit" AGENT_GATE_PRIMITIVES_DIR="$ROOT/scripts" bash "$ROOT/scripts/agent_gate.sh" --decision "$AUDIT_HASH_DECISION" --policy "$ROOT/autonomy.example.yaml" --dry-run
+if grep -R '"_audit_meta"' "$TMP_DIR/hash-audit" >/dev/null 2>&1 && grep -R '"rules_hash"' "$TMP_DIR/hash-audit" >/dev/null 2>&1; then
+  pass "audit hash metadata present"
+else
+  echo "FAIL: audit hash metadata missing" >&2
+  find "$TMP_DIR/hash-audit" -type f -maxdepth 3 -print -exec cat {} \; >&2 || true
   exit 1
 fi
 
