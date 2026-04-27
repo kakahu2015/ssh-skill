@@ -29,18 +29,18 @@ cp hosts.example.yaml hosts.yaml
 
 # 2. 准备真实连接信息。真实 IP/domain/key path 只放 .secrets/。
 mkdir -p .secrets
-cp .secrets/host.env.example .secrets/demo-edge-01.env
+cp .secrets/host.env.example .secrets/demo-host-01.env
 
 # 3. 校验 inventory。
 bash scripts/validate_hosts.sh hosts.yaml --allow-real-hosts
 
 # 4. 连接和观察。
 bash scripts/list_hosts.sh
-bash scripts/connect.sh demo-edge-01
-bash scripts/exec.sh demo-edge-01 "uptime"
+bash scripts/connect.sh demo-host-01
+bash scripts/exec.sh demo-host-01 "uptime"
 ```
 
-批量执行：
+批量只读观察：
 
 ```bash
 bash scripts/runner.sh --target "tag=production" --cmd "uptime" --parallel 20 --timeout 30 --fail-fast 20%
@@ -49,8 +49,8 @@ bash scripts/runner.sh --target "tag=production" --cmd "uptime" --parallel 20 --
 需要显式 sudo 重试时：
 
 ```bash
-bash scripts/exec.sh demo-edge-01 "cat /var/log/app.log | tail -50" --sudo
-bash scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50" --sudo
+bash scripts/exec.sh demo-host-01 "tail -50 <log-path>" --sudo
+bash scripts/runner.sh --target "tag=dev" --cmd "tail -50 <log-path>" --sudo
 ```
 
 ## 核心脚本
@@ -59,6 +59,7 @@ bash scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50
 |------|------|
 | SSH 连接复用 | `connect.sh`, `disconnect.sh` |
 | 自由命令执行 | `exec.sh` |
+| Agent 执行门禁 | `agent_gate.sh` |
 | 批量并发执行 | `runner.sh` |
 | 主机选择 | `select_hosts.sh` |
 | 系统观察 | `sys.sh`, `facts.sh`, `patrol.sh` |
@@ -80,18 +81,17 @@ Agent 不需要死板执行 playbook。推荐循环是：
 observe -> classify -> hypothesize -> choose primitive -> execute under guardrails -> verify -> continue/stop/escalate
 ```
 
-例子：排查某台机器 Caddy 异常：
+泛化示例：排查某台机器上的某个服务异常：
 
 ```bash
-bash scripts/sys.sh demo-edge-01 summary
-bash scripts/service.sh demo-edge-01 status caddy
-bash scripts/sys.sh demo-edge-01 journal caddy 100
-bash scripts/net.sh demo-edge-01 listen 80
-bash scripts/net.sh demo-edge-01 listen 443
-bash scripts/file.sh demo-edge-01 stat /etc/caddy/Caddyfile
+bash scripts/sys.sh <host> summary
+bash scripts/service.sh <host> status <service>
+bash scripts/sys.sh <host> journal <service> 100
+bash scripts/net.sh <host> listen <port>
+bash scripts/file.sh <host> stat <config-path>
 ```
 
-Agent 可以使用自己对 Linux、systemd、网络、文件系统、包管理器和常见服务的知识来选择下一步，但必须用每一步 JSON 输出验证假设，而不是照固定剧本执行。
+Agent 可以使用自己对 Linux、systemd、网络、文件系统、包管理器和服务运行机制的知识来选择下一步，但必须用每一步 JSON 输出验证假设，而不是照固定剧本执行。
 
 ## AI 自治与无人值守
 
@@ -104,6 +104,7 @@ docs/agent-autonomy.zh-CN.md
 docs/agent-autonomy.md
 autonomy.example.yaml
 schemas/decision-record.schema.json
+examples/decision-record.observe.json
 ```
 
 默认无人值守等级建议是 **L1 观察模式**：只允许 bounded read-only primitives。L2/L3 必须通过本地 `autonomy.yaml` 显式配置，并且需要 decision record、verification 和 policy guard。
@@ -125,24 +126,30 @@ schemas/decision-record.schema.json
 cp autonomy.example.yaml autonomy.yaml
 ```
 
-Agent 在执行超出只读观察的动作前，应生成 concise decision record，而不是暴露长篇推理链：
+Agent 在执行超出只读观察的动作前，应生成 concise decision record，而不是暴露长篇推理链。可用 `agent_gate.sh` 做运行时门禁：
+
+```bash
+bash scripts/agent_gate.sh --decision examples/decision-record.observe.json --policy autonomy.example.yaml --dry-run
+```
+
+泛化 decision record 形态：
 
 ```json
 {
-  "intent": "restore web service availability",
-  "autonomy_level": "L2",
-  "observations": ["caddy service is inactive", "port 443 is not listening"],
-  "hypothesis": "service stopped or failed during reload",
-  "risk": "medium",
-  "action": { "primitive": "service.sh", "command": "status caddy" },
+  "intent": "collect bounded service health evidence",
+  "autonomy_level": "L1",
+  "observations": ["target selected from inventory metadata", "requested operation is read-only"],
+  "hypothesis": "bounded observation is needed before diagnosis or change",
+  "risk": "low",
+  "action": { "primitive": "service.sh", "args": ["<host>", "status", "<service>"] },
   "guardrails": {
     "requires_confirmation": false,
     "requires_lock": false,
     "rollback_available": false
   },
-  "verification": ["check service status", "check port 443 listen state"],
-  "stop_condition": "service active and port 443 listening, or policy blocks change",
-  "confidence": "medium"
+  "verification": ["agent_gate validates autonomy level, risk, primitive, and policy boundary"],
+  "stop_condition": "gate succeeds or reports an autonomy/policy/schema error",
+  "confidence": "high"
 }
 ```
 
@@ -167,21 +174,21 @@ autonomy.yaml
 
 ```yaml
 hosts:
-  prod-edge-01:
-    host: prod-edge-01                  # placeholder；真实 HOST 放 .secrets/prod-edge-01.env
+  demo-host-01:
+    host: demo-host-01                 # placeholder；真实 HOST 放 .secrets/demo-host-01.env
     port: 22
     user: ubuntu
     auth: key
-    key_path: /keys/prod-edge-01        # placeholder；真实 KEY_PATH 放 .secrets/prod-edge-01.env
-    default_workdir: /opt/myapp
-    provider: oci
-    region: us-west
+    key_path: /keys/demo-host-01       # placeholder；真实 KEY_PATH 放 .secrets/demo-host-01.env
+    default_workdir: /opt/workdir
+    provider: demo-provider
+    region: demo-region
     env: prod
-    role: edge
-    tags: [production, us-west, caddy, edge]
+    role: generic-role
+    tags: [production, generic]
 ```
 
-对应 `.secrets/prod-edge-01.env`：
+对应 `.secrets/demo-host-01.env`：
 
 ```bash
 HOST=203.0.113.10
@@ -217,8 +224,8 @@ bash scripts/validate_hosts.sh hosts.yaml --allow-real-hosts
 确认方式：
 
 ```bash
-bash scripts/exec.sh prod-edge-01 "sudo systemctl restart caddy" --confirm
-SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh prod-edge-01 "sudo systemctl restart caddy"
+bash scripts/exec.sh <host> "sudo systemctl restart <service>" --confirm
+SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh <host> "sudo systemctl restart <service>"
 ```
 
 ## sudo 行为
@@ -235,8 +242,8 @@ SSH_SKILL_CONFIRMED=yes bash scripts/exec.sh prod-edge-01 "sudo systemctl restar
 显式授权才重试：
 
 ```bash
-bash scripts/exec.sh demo-edge-01 "cat /var/log/app.log | tail -50" --sudo
-SSH_SKILL_ALLOW_SUDO_RETRY=yes bash scripts/exec.sh demo-edge-01 "cat /var/log/app.log | tail -50"
+bash scripts/exec.sh <host> "tail -50 <log-path>" --sudo
+SSH_SKILL_ALLOW_SUDO_RETRY=yes bash scripts/exec.sh <host> "tail -50 <log-path>"
 ```
 
 sudo 重试前仍会重新走 policy guard。
@@ -272,9 +279,10 @@ sudo 重试前仍会重新走 policy guard。
 ```bash
 bash -n scripts/*.sh
 bash scripts/validate_hosts.sh hosts.example.yaml
+bash scripts/agent_gate.sh --decision examples/decision-record.observe.json --policy autonomy.example.yaml --dry-run
 ```
 
-GitHub Actions 会运行语法检查、示例 inventory 校验，以及非阻断的 ShellCheck advisory。
+GitHub Actions 会运行语法检查、示例 inventory 校验、generic agent gate dry-run，以及非阻断的 ShellCheck advisory。
 
 ## 与 Ansible 的区别
 
