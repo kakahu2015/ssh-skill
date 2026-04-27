@@ -16,3 +16,4 @@ autonomy.yaml
 .DS_Store
 *.swp
 *.tmp
+__pycache__/
