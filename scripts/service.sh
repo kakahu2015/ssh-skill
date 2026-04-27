@@ -43,11 +43,14 @@ case "$ACTION" in
 esac
 
 HOST_COUNT=$(host_count_from_csv "$HOST_NAMES")
-policy_check_command "$CMD" "$HOST_COUNT" "$CONFIRM_FLAG"
+policy_check_command "$CMD" "$HOST_COUNT" "$CONFIRM_FLAG" "$HOST_NAMES"
 RUN_ID="${SSH_SKILL_RUN_ID:-$(make_run_id)}"
 
+EXEC_FLAGS=()
+[[ -n "$CONFIRM_FLAG" ]] && EXEC_FLAGS+=("$CONFIRM_FLAG")
+
 set +e
-RESULT=$(SSH_SKILL_RUN_ID="$RUN_ID" bash "$SCRIPTS_DIR/exec.sh" "$HOST_NAMES" "$CMD" "$CONFIRM_FLAG")
+RESULT=$(SSH_SKILL_RUN_ID="$RUN_ID" bash "$SCRIPTS_DIR/exec.sh" "$HOST_NAMES" "$CMD" "${EXEC_FLAGS[@]}")
 RC=$?
 set -e
 
@@ -55,10 +58,10 @@ SUCCESS=$([ "$RC" -eq 0 ] && echo true || echo false)
 cat <<JSON
 {
   "success": $SUCCESS,
-  "run_id": "$(json_escape "$RUN_ID")",
-  "host_target": "$(json_escape "$HOST_NAMES")",
-  "action": "$(json_escape "$ACTION")",
-  "service": "$(json_escape "$SERVICE_NAME")",
+  "run_id": "$(safe_json_string "$RUN_ID")",
+  "host_target": "$(safe_json_string "$HOST_NAMES")",
+  "action": "$(safe_json_string "$ACTION")",
+  "service": "$(safe_json_string "$SERVICE_NAME")",
   "result": $RESULT
 }
 JSON

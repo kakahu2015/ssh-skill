@@ -1,12 +1,13 @@
 ---
 name: linux-ops
-version: 1.2.0
+version: 1.3.0
 description: >
   Agent-native Linux operations skill over SSH. Use when an AI Agent needs to observe,
   reason about, and operate remote Linux servers using composable primitives: system,
   file, process, network, package, service, transfer, locks, and free-form commands.
   Supports ControlMaster connection reuse, target selection, concurrent batch execution,
-  policy guardrails, output redaction, audit logs, and per-run result storage.
+  policy guardrails, output redaction, audit logs, per-run result storage, explicit sudo
+  retry, and local inventory validation.
 compatibility:
   tools:
     - exec
@@ -41,10 +42,27 @@ The skill provides safe, composable Linux operation primitives. The Agent remain
 - `runner.sh` is the concurrent fleet executor.
 - `select_hosts.sh` is the targeting layer.
 - `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, `pkg.sh`, `service.sh` are Linux operation primitives.
+- `scp_transfer.sh` is the file transfer primitive.
 - `lock.sh` is a coordination primitive for write operations.
+- `validate_hosts.sh` validates local inventory shape and OPSEC hygiene.
 - `common.sh` provides config loading, JSON output, redaction, policy checks, and audit logging.
 
 Prefer primitives over free-form shell when a primitive exists, but do not force a fixed workflow. Let the Agent combine primitives based on observations.
+
+---
+
+## Setup
+
+The public repository ships a safe example inventory only. Real inventory and secrets are local-only.
+
+```bash
+cp skills/ssh/hosts.example.yaml skills/ssh/hosts.yaml
+mkdir -p skills/ssh/.secrets
+cp skills/ssh/.secrets/host.env.example skills/ssh/.secrets/<host>.env
+bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.yaml --allow-real-hosts
+```
+
+Never commit real `hosts.yaml` or `.secrets/` content.
 
 ---
 
@@ -69,11 +87,11 @@ bash skills/ssh/scripts/select_hosts.sh --env prod --region hk --role caddy --cs
 Single host:
 
 ```bash
-bash skills/ssh/scripts/sys.sh hk summary
-bash skills/ssh/scripts/sys.sh hk disk
-bash skills/ssh/scripts/proc.sh hk top 30
-bash skills/ssh/scripts/net.sh hk ports 100
-bash skills/ssh/scripts/service.sh hk status caddy
+bash skills/ssh/scripts/sys.sh <host> summary
+bash skills/ssh/scripts/sys.sh <host> disk
+bash skills/ssh/scripts/proc.sh <host> top 30
+bash skills/ssh/scripts/net.sh <host> ports 100
+bash skills/ssh/scripts/service.sh <host> status caddy
 ```
 
 Fleet:
@@ -106,9 +124,9 @@ Audit logs are written to:
 For write operations that may overlap with other tasks:
 
 ```bash
-bash skills/ssh/scripts/lock.sh hk acquire --timeout 60 --run-id <run_id>
+bash skills/ssh/scripts/lock.sh <host> acquire --timeout 60 --run-id <run_id>
 # perform operation
-bash skills/ssh/scripts/lock.sh hk release --run-id <run_id>
+bash skills/ssh/scripts/lock.sh <host> release --run-id <run_id>
 ```
 
 Do not make lock usage a rigid workflow for read-only operations.
@@ -180,7 +198,7 @@ bash skills/ssh/scripts/pkg.sh <host> install <name> --confirm
 ```bash
 bash skills/ssh/scripts/service.sh <host> status <service>
 bash skills/ssh/scripts/service.sh <host> logs <service>
-bash skills/ssh/scripts/service.sh <host> restart <service>
+bash skills/ssh/scripts/service.sh <host> restart <service> --confirm
 bash skills/ssh/scripts/service.sh <host> stop <service> --confirm
 bash skills/ssh/scripts/service.sh <host> disable <service> --confirm
 ```
@@ -202,7 +220,7 @@ bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/file /remote/file -
 
 ## Security Rules (MUST follow)
 
-1. **Never output credentials**: IPs, usernames, passwords, key paths, and key contents must not appear in conversation.
+1. **Never output credentials or infrastructure identifiers**: IPs, usernames, passwords, key paths, `.secrets` paths, private hostnames, and key contents must not appear in conversation.
 2. **Never read private key contents**: reference keys by path only. Never `cat` private keys.
 3. **Never modify `.secrets/` from Agent commands** unless the user explicitly requests it.
 4. **Observe before changing**: for unclear problems, use `sys.sh`, `file.sh`, `proc.sh`, `net.sh`, and `service.sh status/logs` before applying changes.
@@ -210,47 +228,82 @@ bash skills/ssh/scripts/scp_transfer.sh <host> upload /local/file /remote/file -
 6. **Use runner for fleets**: for more than a few hosts, use `runner.sh` with `--parallel`, `--timeout`, and preferably `--fail-fast`.
 7. **Use locks for write operations**: when doing multi-step writes on a host, use `lock.sh acquire/release`.
 8. **Confirm destructive commands**: high-risk operations require `--confirm` or `SSH_SKILL_CONFIRMED=yes`.
-9. **No sudo passwords**: do not embed sudo passwords in commands. Suggest NOPASSWD sudoers or manual operation.
-10. **Truncate large outputs**: use limits in primitives or add `head`/`tail` to raw commands.
-11. **Do not auto-kill busy processes**: file upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
-12. **Review summaries before follow-up actions**: for batch runs, inspect failed hosts before remediation.
+9. **Confirm prod-impacting medium-risk commands**: if `env` is `prod/production` or tags contain `prod/production`, restarts and package changes require confirmation.
+10. **No implicit sudo**: do not rely on automatic sudo retry. Use `--sudo` only when the user intent requires it.
+11. **No sudo passwords**: do not embed sudo passwords in commands. Suggest NOPASSWD sudoers or manual operation.
+12. **Truncate large outputs**: use limits in primitives or add `head`/`tail` to raw commands.
+13. **Do not auto-kill busy processes**: file upload busy-release requires `--force-release` or `SSH_SKILL_FORCE_RELEASE=yes`.
+14. **Review summaries before follow-up actions**: for batch runs, inspect failed hosts before remediation.
 
 ---
 
 ## Policy Guard
 
-The skill keeps guardrails minimal so Agent autonomy is preserved. It blocks only clearly risky operations unless explicitly confirmed.
-
 High-risk examples:
 
-- `rm -rf /`
-- `mkfs`
-- `dd if=`
-- `shutdown` / `reboot`
-- `iptables -F`
-- `ufw disable`
-- `killall`
-- `fuser -k`
-- `systemctl stop`
-- `systemctl disable`
+- Reading private keys, `/etc/shadow`, or `/etc/sudoers`
+- `rm -rf /`, `rm -rf /etc`, `rm -rf /usr`, `rm -rf /home`, `rm -rf /root`
+- `mkfs`, `wipefs`, `fdisk`, `parted`, `sgdisk`
+- `dd ... of=/dev/...`
+- `shutdown`, `reboot`, `poweroff`, `halt`
+- `iptables -F`, `ip6tables -F`, `nft flush`, `ufw disable`
+- `killall`, `fuser -k`
+- `systemctl stop`, `systemctl disable`, `systemctl mask`
+- `docker rm -f`, `docker system prune`
+- `kubectl delete`
+- `bash -c` / `sh -c` mixed with `base64 -d`, `curl`, or `wget`
 
-Medium-risk commands, such as broad service restarts, require confirmation when they affect more than 20 hosts.
+Medium-risk examples:
+
+- `systemctl restart/reload`
+- `service <name> restart/reload`
+- `chmod 777`, `chown -R`
+- package install/remove/upgrade commands
+- `docker restart/stop`
+- `kubectl apply/rollout/scale`
+
+Medium risk requires confirmation when it affects more than 20 hosts or any production-tagged target.
 
 Confirm explicitly:
 
 ```bash
-bash skills/ssh/scripts/exec.sh hk "sudo systemctl stop caddy" --confirm
-```
-
-or:
-
-```bash
-SSH_SKILL_CONFIRMED=yes bash skills/ssh/scripts/exec.sh hk "sudo systemctl stop caddy"
+bash skills/ssh/scripts/exec.sh <host> "sudo systemctl restart caddy" --confirm
+SSH_SKILL_CONFIRMED=yes bash skills/ssh/scripts/exec.sh <host> "sudo systemctl restart caddy"
 ```
 
 ---
 
-## hosts.yaml Format
+## sudo Retry
+
+`exec.sh` does not automatically retry with sudo after `Permission denied`.
+
+Default JSON result includes:
+
+```json
+{
+  "error": "permission_denied",
+  "sudo_used": false
+}
+```
+
+Explicit sudo retry:
+
+```bash
+bash skills/ssh/scripts/exec.sh <host> "cat /var/log/app.log | tail -50" --sudo
+bash skills/ssh/scripts/runner.sh --target "tag=dev" --cmd "cat /var/log/app.log | tail -50" --sudo
+```
+
+Environment opt-in:
+
+```bash
+SSH_SKILL_ALLOW_SUDO_RETRY=yes bash skills/ssh/scripts/exec.sh <host> "cat /var/log/app.log | tail -50"
+```
+
+The sudo retry path still runs `policy_check_command` before execution.
+
+---
+
+## Inventory Format
 
 ```yaml
 hosts:
@@ -271,15 +324,34 @@ hosts:
 Corresponding `.secrets/prod-edge-01.env`:
 
 ```bash
-HOST=1.2.3.4
-KEY_PATH=/root/.ssh/id_ed25519
+HOST=203.0.113.10
+KEY_PATH=/path/to/private/key
+# SSH_PASSWORD=your_password_here
 ```
 
-For password auth:
+Validate inventory:
 
 ```bash
-SSH_PASSWORD=your_password
+bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.example.yaml
+bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.yaml --allow-real-hosts
 ```
+
+---
+
+## Output Redaction
+
+All user-visible JSON and audit command fields should flow through `safe_json_string` or `redact_string`.
+
+Redaction covers:
+
+- password/passwd/secret/token/api_key/ssh_password/private_key assignments
+- private key block headers/footers
+- IPv4 and common IPv6 forms
+- `user@host` SSH targets
+- `.ssh` paths
+- `.secrets` paths
+- `/keys/...` placeholders
+- concrete `SSH_HOST`, `SSH_USER`, `KEY_PATH`, and `SECRETS_ENV` loaded from the active host config
 
 ---
 
@@ -303,13 +375,25 @@ Use primitive limits where possible.
 
 | Error | Action |
 |-------|--------|
-| `hosts.yaml` not found | Show format guide and ask user to create it |
+| `hosts.yaml` not found | Copy `hosts.example.yaml` to `hosts.yaml`, then add real values under `.secrets/` |
 | Host not in yaml | List existing hosts and ask user to add the host |
 | `sshpass` not installed | Suggest installing `sshpass` or switching to key auth |
 | Connection timeout | Check host/port/firewall and retry later |
 | Auth failed | Check `.secrets/` config; do not output credentials |
 | ControlMaster socket expired | Auto re-run `connect.sh`, then retry |
 | `policy_blocked` | Ask for explicit confirmation before continuing |
+| `permission_denied` | Ask whether to retry with `--sudo`; do not auto-sudo |
 | `target_busy` | Ask whether to retry with `--force-release` |
 | `lock_owned_by_other` | Wait, inspect lock status, or ask before force unlock |
 | Command `exit_code != 0` | Return JSON result and summarize failed hosts |
+
+---
+
+## Local Quality Checks
+
+```bash
+bash -n skills/ssh/scripts/*.sh
+bash skills/ssh/scripts/validate_hosts.sh skills/ssh/hosts.example.yaml
+```
+
+GitHub Actions runs syntax checks, example inventory validation, and advisory ShellCheck.
