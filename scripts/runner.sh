@@ -15,10 +15,11 @@ REMOTE_CMD=""
 PARALLEL=10
 TIMEOUT_SEC=0
 CONFIRM_FLAG=""
+SUDO_FLAG=""
 FAIL_FAST_PERCENT=0
 
 usage() {
-    cat <<'EOF'
+    cat <<'USAGE'
 Usage: runner.sh (--hosts <csv>|--target <expr>) --cmd <command> [options]
 
 Targeting:
@@ -31,10 +32,11 @@ Execution:
   --timeout <sec>           Per-host timeout if GNU timeout exists, default: 0 disabled
   --fail-fast <percent>     Stop scheduling more hosts if failure rate reaches percent
   --confirm                 Allow medium/high risk commands per policy
+  --sudo                    Retry with sudo only after Permission denied
 
 Output:
   JSON summary on stdout. Full per-host stdout/stderr saved under .runs/<run_id>/
-EOF
+USAGE
 }
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +55,8 @@ while [[ $# -gt 0 ]]; do
             FAIL_FAST_PERCENT="${2:?--fail-fast 缺少百分比}"; FAIL_FAST_PERCENT="${FAIL_FAST_PERCENT%%%}"; shift 2 ;;
         --confirm)
             CONFIRM_FLAG="--confirm"; shift ;;
+        --sudo)
+            SUDO_FLAG="--sudo"; shift ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -64,7 +68,7 @@ done
 [[ -n "$HOST_CSV" || -n "$TARGET_EXPR" ]] || die_json "missing_arg" "必须提供 --hosts 或 --target"
 [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 ]] || die_json "invalid_arg" "--parallel 必须是正整数"
 [[ "$TIMEOUT_SEC" =~ ^[0-9]+$ ]] || die_json "invalid_arg" "--timeout 必须是整数秒"
-[[ "$FAIL_FAST_PERCENT" =~ ^[0-9]+$ ]] || die_json "invalid_arg" "--fail-fast 必须是 0-100 的整数"
+[[ "$FAIL_FAST_PERCENT" =~ ^[0-9]+$ && "$FAIL_FAST_PERCENT" -le 100 ]] || die_json "invalid_arg" "--fail-fast 必须是 0-100 的整数"
 
 if [[ -n "$TARGET_EXPR" ]]; then
     HOST_CSV="$(bash "$SCRIPTS_DIR/select_hosts.sh" --target "$TARGET_EXPR" --csv)"
@@ -79,7 +83,7 @@ done
 
 TOTAL=${#HOSTS[@]}
 [[ "$TOTAL" -gt 0 ]] || die_json "empty_target" "没有匹配到目标主机"
-policy_check_command "$REMOTE_CMD" "$TOTAL" "$CONFIRM_FLAG"
+policy_check_command "$REMOTE_CMD" "$TOTAL" "$CONFIRM_FLAG" "$HOST_CSV"
 
 RUN_ID="${SSH_SKILL_RUN_ID:-$(make_run_id)}"
 RUN_DIR="$RUNS_DIR/$RUN_ID"
@@ -88,49 +92,44 @@ LOG_DIR="$RUN_DIR/logs"
 mkdir -p "$RESULT_DIR" "$LOG_DIR"
 
 run_one() {
-    local host="$1" out="$RESULT_DIR/${host}.json" err="$LOG_DIR/${host}.stderr" rc_file="$LOG_DIR/${host}.rc"
+    local host="$1" out="$RESULT_DIR/${host}.json" err="$LOG_DIR/${host}.stderr" rc_file="$LOG_DIR/${host}.rc" rc local_err
     set +e
     if [[ "$TIMEOUT_SEC" -gt 0 ]] && command -v timeout >/dev/null 2>&1; then
-        SSH_SKILL_RUN_ID="$RUN_ID" timeout "$TIMEOUT_SEC" bash "$SCRIPTS_DIR/exec.sh" "$host" "$REMOTE_CMD" "$CONFIRM_FLAG" >"$out" 2>"$err"
+        SSH_SKILL_RUN_ID="$RUN_ID" timeout "$TIMEOUT_SEC" bash "$SCRIPTS_DIR/exec.sh" "$host" "$REMOTE_CMD" ${CONFIRM_FLAG:+"$CONFIRM_FLAG"} ${SUDO_FLAG:+"$SUDO_FLAG"} >"$out" 2>"$err"
         rc=$?
     else
-        SSH_SKILL_RUN_ID="$RUN_ID" bash "$SCRIPTS_DIR/exec.sh" "$host" "$REMOTE_CMD" "$CONFIRM_FLAG" >"$out" 2>"$err"
+        SSH_SKILL_RUN_ID="$RUN_ID" bash "$SCRIPTS_DIR/exec.sh" "$host" "$REMOTE_CMD" ${CONFIRM_FLAG:+"$CONFIRM_FLAG"} ${SUDO_FLAG:+"$SUDO_FLAG"} >"$out" 2>"$err"
         rc=$?
     fi
     set -e
 
     if [[ "$rc" -eq 124 ]]; then
         cat >"$out" <<JSON
-{"success":false,"run_id":"$(json_escape "$RUN_ID")","host":"$(json_escape "$host")","error":"timeout","exit_code":124,"stdout":"","stderr":"per-host timeout after ${TIMEOUT_SEC}s"}
+{"success":false,"run_id":"$(safe_json_string "$RUN_ID")","host":"$(safe_json_string "$host")","error":"timeout","exit_code":124,"stdout":"","stderr":"per-host timeout after ${TIMEOUT_SEC}s"}
 JSON
     elif [[ ! -s "$out" ]]; then
-        local local_err
         local_err="$(redact_string "$(cat "$err" 2>/dev/null || true)")"
         cat >"$out" <<JSON
-{"success":false,"run_id":"$(json_escape "$RUN_ID")","host":"$(json_escape "$host")","error":"runner_failed","exit_code":$rc,"stdout":"","stderr":"$(json_escape "$local_err")"}
+{"success":false,"run_id":"$(safe_json_string "$RUN_ID")","host":"$(safe_json_string "$host")","error":"runner_failed","exit_code":$rc,"stdout":"","stderr":"$(json_escape "$local_err")"}
 JSON
     fi
     echo "$rc" >"$rc_file"
 }
 
-scheduled=0
-completed_waits=0
 stop_scheduling=0
 
 for host in "${HOSTS[@]}"; do
     if [[ "$stop_scheduling" -eq 1 ]]; then
         cat >"$RESULT_DIR/${host}.json" <<JSON
-{"success":false,"run_id":"$(json_escape "$RUN_ID")","host":"$(json_escape "$host")","error":"skipped_fail_fast","exit_code":125,"stdout":"","stderr":"skipped because fail-fast threshold was reached"}
+{"success":false,"run_id":"$(safe_json_string "$RUN_ID")","host":"$(safe_json_string "$host")","error":"skipped_fail_fast","exit_code":125,"stdout":"","stderr":"skipped because fail-fast threshold was reached"}
 JSON
         continue
     fi
 
     run_one "$host" &
-    scheduled=$((scheduled + 1))
 
     while [[ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$PARALLEL" ]]; do
         wait -n || true
-        completed_waits=$((completed_waits + 1))
         if [[ "$FAIL_FAST_PERCENT" -gt 0 ]]; then
             done_count=$(find "$RESULT_DIR" -name '*.json' | wc -l | tr -d ' ')
             fail_count=$(grep -L '"success": true' "$RESULT_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ' || true)
@@ -162,7 +161,6 @@ for host in "${HOSTS[@]}"; do
     fi
 done
 
-# Build a compact common_errors summary using simple text extraction.
 COMMON_ERRORS_FILE="$RUN_DIR/common_errors.txt"
 : > "$COMMON_ERRORS_FILE"
 for f in "$RESULT_DIR"/*.json; do
@@ -178,17 +176,17 @@ SUCCESS=$([ "$FAILED" -eq 0 ] && echo true || echo false)
 cat > "$RUN_DIR/summary.json" <<JSON
 {
   "success": $SUCCESS,
-  "run_id": "$(json_escape "$RUN_ID")",
-  "target": "$(json_escape "${TARGET_EXPR:-$HOST_CSV}")",
-  "risk": "$(policy_risk_for_command "$REMOTE_CMD")",
+  "run_id": "$(safe_json_string "$RUN_ID")",
+  "target": "$(safe_json_string "${TARGET_EXPR:-$HOST_CSV}")",
+  "risk": "$(safe_json_string "$(policy_risk_for_command "$REMOTE_CMD")")",
   "total": $TOTAL,
   "ok": $OK,
   "failed": $FAILED,
   "skipped": $SKIPPED,
   "parallel": $PARALLEL,
   "timeout_sec": $TIMEOUT_SEC,
-  "results_dir": "$(json_escape "$RESULT_DIR")",
-  "audit_dir": "$(json_escape "$AUDIT_DIR/$(date -u +%Y-%m-%d)")"
+  "results_dir": "$(safe_json_string "$RESULT_DIR")",
+  "audit_dir": "$(safe_json_string "$AUDIT_DIR/$(date -u +%Y-%m-%d)")"
 }
 JSON
 
