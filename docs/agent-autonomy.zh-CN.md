@@ -13,21 +13,21 @@
 而是：
 
 ```text
-观察 -> 分类 -> 假设 -> 选择 primitive -> 在护栏内执行 -> 验证 -> 继续、停止或升级给人
+观察 -> 分类 -> 假设 -> 选择 primitive -> 进入门禁 -> 执行 -> 验证 -> 继续、停止或升级给人
 ```
 
 ## 设计目标
 
 skill 提供操作面，Agent 提供推理。
 
-Agent 可以使用自己对 Linux、网络、文件系统、systemd、包管理器、常见 daemon 和故障模式的知识，但必须先用真实主机观测验证假设，不能把知识储备当成事实。
+Agent 可以使用自己对 Linux、网络、文件系统、服务管理器、包管理器、daemon 和故障模式的知识，但必须先用真实主机观测验证假设，不能把知识储备当成事实。
 
-例子：
+泛化例子：
 
-- Agent 可以知道 Caddy、nginx、Apache 常由 systemd 管理，但要用 `service.sh status`、`sys.sh journal`、`net.sh listen` 验证。
-- Agent 可以知道 Debian 系常用 `apt`、RHEL 系常用 `yum/dnf`、Alpine 常用 `apk`，但要用 `pkg.sh detect` 验证。
-- Agent 可以知道磁盘满会影响日志、包管理器、TLS 续期，但要用 `sys.sh disk`、`file.sh list` 和有限日志查看验证。
-- Agent 可以知道 80/443 通常是 Web 入口，但修改服务前必须确认监听状态和进程归属。
+- Agent 可以知道很多服务由服务管理器托管，但要用 `service.sh status <service>`、有限日志、进程和网络 primitive 验证。
+- Agent 可以知道不同发行版使用不同包管理器，但要用 `pkg.sh detect` 验证。
+- Agent 可以知道磁盘压力会影响很多子系统，但要用 `sys.sh disk`、`file.sh list` 和有限日志查看验证。
+- Agent 可以知道端口监听可能代表服务可用，但修改服务前必须确认监听状态和归属。
 
 ## 什么应该放进 skill
 
@@ -35,6 +35,7 @@ skill 应该包含：
 
 - 小而可组合的 primitives
 - 结构化 JSON 输出
+- runtime autonomy gate
 - 策略护栏和 policy 检查
 - 脱敏和审计日志
 - 目标选择和有边界的批量执行
@@ -65,31 +66,55 @@ skill 应该避免：
 
 默认无人值守模式应该是 **L1**。只有在用户显式配置并有严格护栏时，才能提升到 L2 或 L3。
 
+## Runtime Gate
+
+`agent_gate.sh` 把自治模型变成运行时门禁。它仍然是通用组件：不知道业务服务、部署步骤或修复流程。
+
+```bash
+bash scripts/agent_gate.sh --decision examples/decision-record.observe.json --policy autonomy.example.yaml --dry-run
+```
+
+它负责：
+
+1. 解析并校验 decision record。
+2. 读取本地 autonomy policy。
+3. 检查自治等级、风险、环境、主机数量和 primitive 允许范围。
+4. 默认阻断 raw `exec.sh`，除非显式授权。
+5. 只有在 `--execute` 时才执行一个 primitive。
+6. 如果提供了 executable verification actions，则执行验证。
+7. 验证失败后可以按配置执行 rollback actions。
+8. 写入脱敏后的 decision audit 文件。
+
 ## 无人值守决策契约
 
 在执行任何超出只读观察的无人值守动作前，Agent 应该生成结构化 decision record。这不是暴露长篇推理链，而是一份可审计的操作摘要。
 
-最小字段：
+泛化形态：
 
 ```json
 {
-  "intent": "restore web service availability",
-  "autonomy_level": "L2",
-  "observations": ["caddy service is inactive", "port 443 is not listening"],
-  "hypothesis": "service stopped or failed during reload",
-  "risk": "medium",
+  "intent": "collect bounded service health evidence",
+  "autonomy_level": "L1",
+  "target_scope": { "hosts": ["<host>"], "environment": "<env>" },
+  "observations": ["target selected from metadata", "requested operation is read-only"],
+  "hypothesis": "bounded observation is needed before diagnosis or change",
+  "risk": "low",
   "action": {
     "primitive": "service.sh",
-    "command": "status caddy"
+    "args": ["<host>", "status", "<service>"]
   },
   "guardrails": {
     "requires_confirmation": false,
     "requires_lock": false,
-    "rollback_available": false
+    "rollback_available": false,
+    "max_hosts": 1
   },
-  "verification": ["check service status", "check port 443 listen state"],
-  "stop_condition": "service active and port 443 listening, or policy blocks change",
-  "confidence": "medium"
+  "verification": ["gate validates autonomy level, risk, primitive, and policy boundary"],
+  "verification_actions": [],
+  "rollback": [],
+  "rollback_actions": [],
+  "stop_condition": "gate succeeds or reports an autonomy/policy/schema error",
+  "confidence": "high"
 }
 ```
 
@@ -107,7 +132,7 @@ schemas/decision-record.schema.json
 
 ### 2. 优先使用语义 primitive
 
-优先用 `sys.sh`、`file.sh`、`proc.sh`、`net.sh`、`pkg.sh`、`service.sh`。只有没有合适 primitive 时再用 `exec.sh`。
+优先用 `sys.sh`、`file.sh`、`proc.sh`、`net.sh`、`pkg.sh`、`service.sh`。只有没有合适 primitive 时再用 `exec.sh`；如果存在 decision record，应优先经过 `agent_gate.sh`。
 
 ### 3. 观察必须有边界
 
@@ -123,7 +148,7 @@ schemas/decision-record.schema.json
 
 ### 6. 优先可逆操作
 
-改文件前备份。适合 reload 时不要直接 restart。批量变更前先单机 canary。
+改文件前备份。选择能达成目标的最小扰动操作。批量变更前先单机 canary。
 
 ### 7. 歧义时升级
 
@@ -138,8 +163,8 @@ schemas/decision-record.schema.json
 2. 观察 facts 和当前状态
 3. 分类主机、环境、服务和风险
 4. 构造 decision record
-5. 检查自治等级和 policy guard
-6. 执行一个 primitive
+5. 通过 agent_gate.sh 门禁
+6. 如果允许，执行一个 primitive
 7. 验证结果
 8. 更新审计轨迹
 9. 继续、停止或升级
@@ -147,17 +172,17 @@ schemas/decision-record.schema.json
 
 循环由 Agent 控制。skill 只提供可靠工具和边界。
 
-## 示例
+## 泛化示例
 
 ### 示例：只读故障分诊
 
 L1 允许：
 
 ```bash
-bash scripts/sys.sh edge-01 summary
-bash scripts/service.sh edge-01 status caddy
-bash scripts/sys.sh edge-01 journal caddy 100
-bash scripts/net.sh edge-01 listen 443
+bash scripts/sys.sh <host> summary
+bash scripts/service.sh <host> status <service>
+bash scripts/sys.sh <host> journal <service> 100
+bash scripts/net.sh <host> listen <port>
 ```
 
 Agent 可以据此总结可能原因并提出下一步。
@@ -170,44 +195,39 @@ Agent 可以据此总结可能原因并提出下一步。
 preconditions:
   env != prod
   service is known
-  recent logs indicate failed transient state
-  restart policy allows this service
+  recent bounded observations indicate a transient failed state
+  restart policy allows this primitive
   verification is defined
 ```
 
-动作：
+通过 gate 执行动作：
 
 ```bash
-bash scripts/service.sh dev-edge-01 restart caddy --confirm
+bash scripts/agent_gate.sh --decision <decision.json> --policy <autonomy.yaml> --execute
 ```
 
-验证：
+具体 primitive 和 args 由 decision record 指定，而不是写死在脚本里。
 
-```bash
-bash scripts/service.sh dev-edge-01 status caddy
-bash scripts/net.sh dev-edge-01 listen 443
-```
-
-### 示例：生产服务重启
+### 示例：生产影响变更
 
 默认必须升级给人：
 
 ```text
 env == prod
-risk == medium
+risk >= medium
 requires_confirmation == true
 ```
 
-Agent 应该生成 decision record 并请求批准，而不是无人值守重启。
+Agent 应该生成 decision record 并请求批准，而不是无人值守修改生产环境。
 
 ## 反模式
 
 不要把这个 skill 做成：
 
-- `fix_caddy.sh`
-- `deploy_my_app.sh`
-- `cleanup_all_servers.sh`
-- `repair_everything.sh`
+- 特定应用修复脚本
+- 特定应用部署脚本
+- 一次性清理脚本
+- 广义 repair-all 脚本
 - 隐藏 playbook runner
 
 如果某个 workflow 有价值，应把它写成 Agent 推理模式，而不是写成僵硬脚本；除非它确实是通用 primitive。
