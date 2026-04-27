@@ -1,0 +1,22 @@
+name: Shell CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n scripts/*.sh
+      - name: Validate example inventory
+        run: bash scripts/validate_hosts.sh hosts.example.yaml
+      - name: ShellCheck advisory
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/*.sh
